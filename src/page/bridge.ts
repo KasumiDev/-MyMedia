@@ -105,13 +105,17 @@ function sanitize(operation: BridgeOperation, json: unknown): unknown {
   const mediaResponse = response as { data?: unknown; aggregationData?: { accountMedia?: unknown } };
   const data = Array.isArray(mediaResponse?.data) ? mediaResponse.data : [];
   const media = Array.isArray(mediaResponse?.aggregationData?.accountMedia) ? mediaResponse.aggregationData.accountMedia : [];
-  const video = selectDirect720pVideo(media);
+  const video = selectDirectVideo(media);
+  const dashManifest = selectDashManifest(media);
+  const hlsManifest = selectHlsManifest(media);
   return {
     offerCount: data.length,
     accountMediaCount: media.length,
     // The signed URL is transferred only in-memory to immediately request a
     // Chrome download. It is never rendered, logged, or persisted.
-    direct720pVideo: video
+    directVideo: video,
+    dashManifest,
+    hlsManifest
   };
 }
 
@@ -129,8 +133,9 @@ function groupSummary(value: unknown): { groupId: string; partnerUsername: strin
 }
 
 type DirectVideo = { url: string; filename: string; width: number; height: number };
+type DashManifest = { url: string; filename: string; width: number; height: number };
 
-function selectDirect720pVideo(accountMedia: unknown[]): DirectVideo | null {
+function selectDirectVideo(accountMedia: unknown[]): DirectVideo | null {
   const candidates: DirectVideo[] = [];
   for (const accountMediaRecord of accountMedia) {
     const media = (accountMediaRecord as { media?: unknown })?.media as Record<string, unknown> | undefined;
@@ -138,16 +143,69 @@ function selectDirect720pVideo(accountMedia: unknown[]): DirectVideo | null {
     for (const rendition of [media, ...(Array.isArray(media.variants) ? media.variants : [])] as Record<string, unknown>[]) {
       const mimetype = typeof rendition.mimetype === "string" ? rendition.mimetype.toLowerCase() : "";
       const locations = Array.isArray(rendition.locations) ? rendition.locations : [];
-      const url = locations.map((entry) => (entry as { location?: unknown }).location).find((value): value is string => typeof value === "string");
+      const url = locations.map(signedLocation).find((value): value is string => typeof value === "string");
       const width = typeof rendition.width === "number" ? rendition.width : 0;
       const height = typeof rendition.height === "number" ? rendition.height : 0;
-      if (!mimetype.startsWith("video/") || !url || height <= 0 || height > 720) continue;
+      if (!mimetype.startsWith("video/") || !url || height <= 0) continue;
       const mediaId = typeof rendition.id === "string" || typeof rendition.id === "number" ? String(rendition.id) : "video";
-      candidates.push({ url, filename: `Fansly MyMedia/${mediaId}-720p.mp4`, width, height });
+      candidates.push({ url, filename: `Fansly MyMedia/${mediaId}-direct.mp4`, width, height });
     }
   }
   candidates.sort((left, right) => right.height - left.height || right.width - left.width);
   return candidates[0] ?? null;
+}
+
+function selectDashManifest(accountMedia: unknown[]): DashManifest | null {
+  const candidates: DashManifest[] = [];
+  for (const accountMediaRecord of accountMedia) {
+    const media = (accountMediaRecord as { media?: unknown })?.media as Record<string, unknown> | undefined;
+    if (!media || !Array.isArray(media.variants)) continue;
+    for (const rendition of media.variants as Record<string, unknown>[]) {
+      if (String(rendition.mimetype).toLowerCase() !== "application/dash+xml") continue;
+      const locations = Array.isArray(rendition.locations) ? rendition.locations : [];
+      const url = locations.map(signedLocation).find((value): value is string => typeof value === "string");
+      if (!url) continue;
+      const width = typeof rendition.width === "number" ? rendition.width : 0;
+      const height = typeof rendition.height === "number" ? rendition.height : 0;
+      const mediaId = typeof rendition.id === "string" || typeof rendition.id === "number" ? String(rendition.id) : "manifest";
+      candidates.push({ url, filename: `Fansly MyMedia/${mediaId}.mpd`, width, height });
+    }
+  }
+  candidates.sort((left, right) => right.height - left.height || right.width - left.width);
+  return candidates[0] ?? null;
+}
+
+function selectHlsManifest(accountMedia: unknown[]): DashManifest | null {
+  const candidates: DashManifest[] = [];
+  for (const accountMediaRecord of accountMedia) {
+    const media = (accountMediaRecord as { media?: unknown })?.media as Record<string, unknown> | undefined;
+    if (!media || !Array.isArray(media.variants)) continue;
+    for (const rendition of media.variants as Record<string, unknown>[]) {
+      if (String(rendition.mimetype).toLowerCase() !== "application/vnd.apple.mpegurl") continue;
+      const locations = Array.isArray(rendition.locations) ? rendition.locations : [];
+      const url = locations.map(signedLocation).find((value): value is string => typeof value === "string");
+      if (!url) continue;
+      const width = typeof rendition.width === "number" ? rendition.width : 0;
+      const height = typeof rendition.height === "number" ? rendition.height : 0;
+      const mediaId = typeof rendition.id === "string" || typeof rendition.id === "number" ? String(rendition.id) : "manifest";
+      candidates.push({ url, filename: `Fansly MyMedia/${mediaId}.m3u8`, width, height });
+    }
+  }
+  candidates.sort((left, right) => right.height - left.height || right.width - left.width);
+  return candidates[0] ?? null;
+}
+
+function signedLocation(value: unknown): string | null {
+  const entry = value as { location?: unknown; metadata?: unknown };
+  if (typeof entry?.location !== "string") return null;
+  try {
+    const url = new URL(entry.location);
+    const metadata = entry.metadata as Record<string, unknown> | undefined;
+    for (const key of ["Key-Pair-Id", "Signature", "Policy"]) {
+      if (typeof metadata?.[key] === "string" && !url.searchParams.has(key)) url.searchParams.set(key, metadata[key]);
+    }
+    return url.toString();
+  } catch { return null; }
 }
 
 function emit(result: unknown): void {

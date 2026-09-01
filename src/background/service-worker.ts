@@ -48,5 +48,5 @@ function validMediaUrl(value: unknown): URL | null {
 }
 
 function validFilename(value: unknown): string | null {
-  return typeof value === "string" && /^Fansly MyMedia\/[a-zA-Z0-9_-]+-720p\.mp4$/.test(value) ? value : null;
+  return typeof value === "string" && /^Fansly MyMedia\/[a-zA-Z0-9_-]+(?:-direct\.mp4|\.mpd|\.m3u8)$/.test(value) ? value : null;
 }

@@ -7,6 +7,7 @@ const isValidGroupId = (value: unknown): value is string => typeof value === "st
 
 type Group = { groupId: string; partnerUsername: string };
 type DirectVideo = { url: string; filename: string; width: number; height: number };
+type DashManifest = { url: string; filename: string; width: number; height: number };
 
 const root = document.createElement("div");
 root.id = "fansly-mymedia-spike";
@@ -23,7 +24,9 @@ shadow.innerHTML = `
     <label>Chat ID<input id="chat" inputmode="numeric" placeholder="Select a group or paste a chat ID"></label>
     <select id="groupSelect"><option value="">Loaded groups appear here</option></select>
     <button id="media">Check first MyMedia page</button>
-    <button id="video" disabled>Download first direct 720p video</button>
+    <button id="video" disabled>Download highest-quality direct video</button>
+    <button id="dash" disabled>Download DASH manifest (test only)</button>
+    <button id="hls" disabled>Download HLS manifest (test only)</button>
     <label>Signed media URL<input id="url" type="password" placeholder="Paste a signed media URL" autocomplete="off"></label>
     <button id="download">Download this URL once</button>
     <p class="note">This spike does not retain credentials, signed URLs, or download history.</p>
@@ -35,7 +38,9 @@ const $ = <T extends HTMLElement>(selector: string) => shadow.querySelector(sele
 const status = $("#status");
 const chat = $("#chat") as HTMLInputElement;
 const groupSelect = $("#groupSelect") as HTMLSelectElement;
-let direct720pVideo: DirectVideo | null = null;
+let directVideo: DirectVideo | null = null;
+let dashManifest: DashManifest | null = null;
+let hlsManifest: DashManifest | null = null;
 
 void ensureBridge();
 
@@ -56,17 +61,33 @@ $("#media").onclick = async () => {
   if (!isValidGroupId(chat.value.trim())) return setStatus("Enter a valid numeric chat ID first.");
   const result = await command("media", chat.value.trim());
   if (result.ok) {
-    const payload = result.payload as { offerCount: number; accountMediaCount: number; direct720pVideo: DirectVideo | null };
-    direct720pVideo = payload.direct720pVideo;
-    $("#video").toggleAttribute("disabled", !direct720pVideo);
-    setStatus(`First MyMedia page for ${chat.value}:\nOffers: ${payload.offerCount}\nAccount media: ${payload.accountMediaCount}${direct720pVideo ? `\nDirect video selected: ${direct720pVideo.width}×${direct720pVideo.height}` : "\nNo direct video at 720p or lower found."}`);
+    const payload = result.payload as { offerCount: number; accountMediaCount: number; directVideo: DirectVideo | null; dashManifest: DashManifest | null; hlsManifest: DashManifest | null };
+    directVideo = payload.directVideo;
+    dashManifest = payload.dashManifest;
+    hlsManifest = payload.hlsManifest;
+    $("#video").toggleAttribute("disabled", !directVideo);
+    $("#dash").toggleAttribute("disabled", !dashManifest);
+    $("#hls").toggleAttribute("disabled", !hlsManifest);
+    setStatus(`First MyMedia page for ${chat.value}:\nOffers: ${payload.offerCount}\nAccount media: ${payload.accountMediaCount}${directVideo ? `\nHighest direct video selected: ${directVideo.width}×${directVideo.height}` : "\nNo direct video found."}${dashManifest ? `\nDASH manifest available: ${dashManifest.width}×${dashManifest.height}` : "\nNo DASH manifest found."}${hlsManifest ? `\nHLS manifest available: ${hlsManifest.width}×${hlsManifest.height}` : "\nNo HLS manifest found."}`);
   }
 };
+$("#dash").onclick = async () => {
+  if (!dashManifest) return;
+  setStatus("Asking Chrome to download the DASH manifest…");
+  const result = await chrome.runtime.sendMessage({ type: "fansly-mymedia:download", url: dashManifest.url, filename: dashManifest.filename }) as { ok: boolean; error?: string };
+  setStatus(result.ok ? "DASH manifest downloaded. This test does not assemble media segments." : result.error ?? "DASH manifest download failed.");
+};
+$("#hls").onclick = async () => {
+  if (!hlsManifest) return;
+  setStatus("Asking Chrome to download the HLS manifest…");
+  const result = await chrome.runtime.sendMessage({ type: "fansly-mymedia:download", url: hlsManifest.url, filename: hlsManifest.filename }) as { ok: boolean; error?: string };
+  setStatus(result.ok ? "HLS manifest downloaded. This test does not assemble media segments." : result.error ?? "HLS manifest download failed.");
+};
 $("#video").onclick = async () => {
-  if (!direct720pVideo) return;
-  setStatus("Asking Chrome to start the direct 720p video download…");
-  const result = await chrome.runtime.sendMessage({ type: "fansly-mymedia:download", url: direct720pVideo.url, filename: direct720pVideo.filename }) as { ok: boolean; error?: string };
-  setStatus(result.ok ? "720p video download started. Check Chrome’s downloads page." : result.error ?? "Download failed.");
+  if (!directVideo) return;
+  setStatus("Asking Chrome to start the highest-quality direct video download…");
+  const result = await chrome.runtime.sendMessage({ type: "fansly-mymedia:download", url: directVideo.url, filename: directVideo.filename }) as { ok: boolean; error?: string };
+  setStatus(result.ok ? "Direct video download started. Check Chrome’s downloads page." : result.error ?? "Download failed.");
 };
 $("#download").onclick = async () => {
   const url = ($("#url") as HTMLInputElement).value.trim();
