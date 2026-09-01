@@ -1,4 +1,4 @@
-export const NORMAL_DELAY_MS = { min: 4_000, max: 16_000 };
+export const NORMAL_DELAY_MS = { min: 1_000, max: 5_000 };
 export const RATE_LIMIT_DELAY_MS = { min: 60_000, max: 120_000 };
 export const MAX_RATE_LIMIT_RETRIES = 5;
 export const MAX_EMPTY_SUGGESTION_RETRIES = 4;

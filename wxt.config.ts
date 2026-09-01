@@ -6,7 +6,7 @@ export default defineConfig({
     name: "Fansly MyMedia (Feasibility Spike)",
     version: "0.1.0",
     description: "Tests authenticated MyMedia access for the currently signed-in Fansly user.",
-    permissions: ["downloads"],
+    permissions: ["downloads", "storage"],
     host_permissions: ["https://fansly.com/*"]
   }
 });

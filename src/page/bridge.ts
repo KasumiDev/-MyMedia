@@ -1,4 +1,5 @@
 import { delay, isEmptySuggestion, MAX_EMPTY_SUGGESTION_RETRIES, MAX_RATE_LIMIT_RETRIES, NORMAL_DELAY_MS, randomDelay, RATE_LIMIT_DELAY_MS } from "../core/retry-policy";
+import { selectDiagnosticManifest, selectDownloadableMedia } from "../core/media-parser";
 
 const BRIDGE_COMMAND = "fansly-mymedia:command";
 export {};
@@ -137,18 +138,22 @@ function sanitize(operation: BridgeOperation, json: unknown): unknown {
   const mediaResponse = response as { data?: unknown; aggregationData?: { accountMedia?: unknown } };
   const data = requiredArray(mediaResponse, ["data"], "MyMedia response was malformed");
   const media = requiredArray(mediaResponse?.aggregationData, ["accountMedia"], "MyMedia aggregation response was malformed");
-  const video = selectDirectVideo(media);
-  const dashManifest = selectDashManifest(media);
-  const hlsManifest = selectHlsManifest(media);
+  const downloadableMedia = selectDownloadableMedia(media);
+  const video = downloadableMedia.filter((item) => item.kind === "video")[0] ?? null;
+  const dashManifest = selectDiagnosticManifest(media, "application/dash+xml");
+  const hlsManifest = selectDiagnosticManifest(media, "application/vnd.apple.mpegurl");
   return {
     offerCount: data.length,
     offers: data.map(offerSummary).filter((offer): offer is { id: string } => offer !== null),
     accountMediaCount: media.length,
     // The signed URL is transferred only in-memory to immediately request a
     // Chrome download. It is never rendered, logged, or persisted.
-    directVideo: video,
-    dashManifest,
-    hlsManifest
+    downloadableMedia,
+    // Compatibility for the Phase 1 panel. Phase 5 consumes
+    // downloadableMedia and creates filenames with the chat partner name.
+    directVideo: video ? { ...video, filename: `Fansly MyMedia/${video.accountMediaId}-direct.${video.extension}` } : null,
+    dashManifest: dashManifest ? { ...dashManifest, filename: `Fansly MyMedia/${dashManifest.accountMediaId}.mpd` } : null,
+    hlsManifest: hlsManifest ? { ...hlsManifest, filename: `Fansly MyMedia/${hlsManifest.accountMediaId}.m3u8` } : null
   };
 }
 
@@ -168,82 +173,6 @@ function groupSummary(value: unknown): { groupId: string; partnerUsername: strin
   return isValidGroupId(String(group?.groupId ?? ""))
     ? { groupId: String(group.groupId), partnerUsername: typeof group.partnerUsername === "string" ? group.partnerUsername : "" }
     : null;
-}
-
-type DirectVideo = { url: string; filename: string; width: number; height: number };
-type DashManifest = { url: string; filename: string; width: number; height: number };
-
-function selectDirectVideo(accountMedia: unknown[]): DirectVideo | null {
-  const candidates: DirectVideo[] = [];
-  for (const accountMediaRecord of accountMedia) {
-    const media = (accountMediaRecord as { media?: unknown })?.media as Record<string, unknown> | undefined;
-    if (!media) continue;
-    for (const rendition of [media, ...(Array.isArray(media.variants) ? media.variants : [])] as Record<string, unknown>[]) {
-      const mimetype = typeof rendition.mimetype === "string" ? rendition.mimetype.toLowerCase() : "";
-      const locations = Array.isArray(rendition.locations) ? rendition.locations : [];
-      const url = locations.map(signedLocation).find((value): value is string => typeof value === "string");
-      const width = typeof rendition.width === "number" ? rendition.width : 0;
-      const height = typeof rendition.height === "number" ? rendition.height : 0;
-      if (!mimetype.startsWith("video/") || !url || height <= 0) continue;
-      const mediaId = typeof rendition.id === "string" || typeof rendition.id === "number" ? String(rendition.id) : "video";
-      candidates.push({ url, filename: `Fansly MyMedia/${mediaId}-direct.mp4`, width, height });
-    }
-  }
-  candidates.sort((left, right) => right.height - left.height || right.width - left.width);
-  return candidates[0] ?? null;
-}
-
-function selectDashManifest(accountMedia: unknown[]): DashManifest | null {
-  const candidates: DashManifest[] = [];
-  for (const accountMediaRecord of accountMedia) {
-    const media = (accountMediaRecord as { media?: unknown })?.media as Record<string, unknown> | undefined;
-    if (!media || !Array.isArray(media.variants)) continue;
-    for (const rendition of media.variants as Record<string, unknown>[]) {
-      if (String(rendition.mimetype).toLowerCase() !== "application/dash+xml") continue;
-      const locations = Array.isArray(rendition.locations) ? rendition.locations : [];
-      const url = locations.map(signedLocation).find((value): value is string => typeof value === "string");
-      if (!url) continue;
-      const width = typeof rendition.width === "number" ? rendition.width : 0;
-      const height = typeof rendition.height === "number" ? rendition.height : 0;
-      const mediaId = typeof rendition.id === "string" || typeof rendition.id === "number" ? String(rendition.id) : "manifest";
-      candidates.push({ url, filename: `Fansly MyMedia/${mediaId}.mpd`, width, height });
-    }
-  }
-  candidates.sort((left, right) => right.height - left.height || right.width - left.width);
-  return candidates[0] ?? null;
-}
-
-function selectHlsManifest(accountMedia: unknown[]): DashManifest | null {
-  const candidates: DashManifest[] = [];
-  for (const accountMediaRecord of accountMedia) {
-    const media = (accountMediaRecord as { media?: unknown })?.media as Record<string, unknown> | undefined;
-    if (!media || !Array.isArray(media.variants)) continue;
-    for (const rendition of media.variants as Record<string, unknown>[]) {
-      if (String(rendition.mimetype).toLowerCase() !== "application/vnd.apple.mpegurl") continue;
-      const locations = Array.isArray(rendition.locations) ? rendition.locations : [];
-      const url = locations.map(signedLocation).find((value): value is string => typeof value === "string");
-      if (!url) continue;
-      const width = typeof rendition.width === "number" ? rendition.width : 0;
-      const height = typeof rendition.height === "number" ? rendition.height : 0;
-      const mediaId = typeof rendition.id === "string" || typeof rendition.id === "number" ? String(rendition.id) : "manifest";
-      candidates.push({ url, filename: `Fansly MyMedia/${mediaId}.m3u8`, width, height });
-    }
-  }
-  candidates.sort((left, right) => right.height - left.height || right.width - left.width);
-  return candidates[0] ?? null;
-}
-
-function signedLocation(value: unknown): string | null {
-  const entry = value as { location?: unknown; metadata?: unknown };
-  if (typeof entry?.location !== "string") return null;
-  try {
-    const url = new URL(entry.location);
-    const metadata = entry.metadata as Record<string, unknown> | undefined;
-    for (const key of ["Key-Pair-Id", "Signature", "Policy"]) {
-      if (typeof metadata?.[key] === "string" && !url.searchParams.has(key)) url.searchParams.set(key, metadata[key]);
-    }
-    return url.toString();
-  } catch { return null; }
 }
 
 function emit(result: unknown): void {

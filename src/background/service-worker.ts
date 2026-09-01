@@ -1,3 +1,7 @@
+import { updateDownloadByChromeId, upsertDownloadRecord } from "../storage/download-index";
+
+import { isValidDownloadFilename } from "../core/filenames";
+
 const MEDIA_HOSTS = new Set([
   "cdn1.fansly.com",
   "cdn2.fansly.com",
@@ -10,7 +14,7 @@ const MEDIA_HOSTS = new Set([
 export function installServiceWorker(): void {
   chrome.runtime.onMessage.addListener((message: unknown, sender, sendResponse) => {
   if (!message || typeof message !== "object") return;
-  const request = message as { type?: unknown; url?: unknown; filename?: unknown };
+  const request = message as { type?: unknown; url?: unknown; filename?: unknown; mediaId?: unknown };
 
   if (request.type === "fansly-mymedia:download") {
     const url = validMediaUrl(request.url);
@@ -18,15 +22,43 @@ export function installServiceWorker(): void {
       sendResponse({ ok: false, error: "Only an approved Fansly media URL can be downloaded." });
       return;
     }
+    const filename = validFilename(request.filename) ?? "Fansly MyMedia/feasibility-download";
     void chrome.downloads.download({
       url: url.toString(),
-      filename: validFilename(request.filename) ?? "Fansly MyMedia/feasibility-download",
+      filename,
       conflictAction: "uniquify",
       saveAs: false
-    }).then((downloadId) => sendResponse({ ok: true, downloadId }))
+    }).then((downloadId) => {
+      // Do not persist url: it may contain temporary access signatures.
+      const mediaId = validMediaId(request.mediaId) ?? `download-${downloadId}`;
+      void upsertDownloadRecord({
+        mediaId,
+        filename,
+        state: "downloading",
+        chromeDownloadId: downloadId,
+        updatedAt: Date.now()
+      }).catch(() => {
+        // The download itself succeeded; a transient storage failure must not
+        // make the user believe otherwise.
+      });
+      sendResponse({ ok: true, downloadId });
+    })
       .catch(() => sendResponse({ ok: false, error: "Chrome could not start that download." }));
     return true;
   }
+  });
+
+  chrome.downloads.onChanged.addListener((delta) => {
+    const state = delta.state?.current;
+    if (state !== "complete" && state !== "interrupted") return;
+    void updateDownloadByChromeId(delta.id, (record) => ({
+      ...record,
+      state: state === "complete" ? "completed" : "failed",
+      ...(state === "interrupted" ? { error: delta.error?.current ?? "Chrome download was interrupted." } : { error: undefined }),
+      updatedAt: Date.now()
+    })).catch(() => {
+      // Storage is best-effort here. Do not interfere with Chrome's download.
+    });
   });
 }
 
@@ -39,5 +71,9 @@ function validMediaUrl(value: unknown): URL | null {
 }
 
 function validFilename(value: unknown): string | null {
-  return typeof value === "string" && /^Fansly MyMedia\/[a-zA-Z0-9_-]+(?:-direct\.mp4|\.mpd|\.m3u8)$/.test(value) ? value : null;
+  return isValidDownloadFilename(value) ? value : null;
+}
+
+function validMediaId(value: unknown): string | null {
+  return typeof value === "string" && /^[a-zA-Z0-9_-]{1,128}$/.test(value) ? value : null;
 }
