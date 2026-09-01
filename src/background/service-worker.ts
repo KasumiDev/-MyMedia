@@ -12,17 +12,6 @@ export function installServiceWorker(): void {
   if (!message || typeof message !== "object") return;
   const request = message as { type?: unknown; url?: unknown; filename?: unknown };
 
-  if (request.type === "fansly-mymedia:inject") {
-    if (!sender.tab?.id || sender.url?.startsWith("https://fansly.com/") !== true) {
-      sendResponse({ ok: false, error: "Bridge injection is only allowed on Fansly." });
-      return;
-    }
-    void chrome.scripting.executeScript({ target: { tabId: sender.tab.id }, world: "MAIN", files: ["assets/page-bridge.js"] })
-      .then(() => sendResponse({ ok: true }))
-      .catch(() => sendResponse({ ok: false, error: "Could not inject the page bridge." }));
-    return true;
-  }
-
   if (request.type === "fansly-mymedia:download") {
     const url = validMediaUrl(request.url);
     if (!url || sender.url?.startsWith("https://fansly.com/") !== true) {

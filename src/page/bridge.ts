@@ -2,7 +2,7 @@ const BRIDGE_COMMAND = "fansly-mymedia:command";
 export {};
 const BRIDGE_RESULT = "fansly-mymedia:result";
 type BridgeOperation = "account" | "groups" | "media";
-interface BridgeCommand { type: typeof BRIDGE_COMMAND; requestId: string; operation: BridgeOperation; groupId?: string; }
+interface BridgeCommand { type: typeof BRIDGE_COMMAND; requestId: string; operation: BridgeOperation; groupId?: string; offset?: number; before?: string; }
 const isValidGroupId = (value: unknown): value is string => typeof value === "string" && /^\d{6,30}$/.test(value);
 
 declare global {
@@ -36,12 +36,14 @@ function isCommand(value: unknown): value is BridgeCommand {
   const candidate = value as Partial<BridgeCommand>;
   if (candidate.type !== BRIDGE_COMMAND || typeof candidate.requestId !== "string") return false;
   if (!["account", "groups", "media"].includes(candidate.operation ?? "")) return false;
-  return candidate.operation !== "media" || isValidGroupId(candidate.groupId);
+  if (candidate.operation === "media" && !isValidGroupId(candidate.groupId)) return false;
+  if (candidate.offset !== undefined && (!Number.isInteger(candidate.offset) || candidate.offset < 0 || candidate.offset > 1_000_000)) return false;
+  return candidate.before === undefined || (typeof candidate.before === "string" && /^\d{0,30}$/.test(candidate.before));
 }
 
 async function run(command: BridgeCommand): Promise<void> {
   try {
-    const payload = await request(command.operation, command.groupId);
+    const payload = await request(command.operation, command.groupId, command.offset ?? 0, command.before ?? "");
     emit({ type: BRIDGE_RESULT, requestId: command.requestId, operation: command.operation, ok: true, payload });
   } catch (error) {
     // Deliberately return no response body, headers, URL query values, or credentials.
@@ -49,7 +51,7 @@ async function run(command: BridgeCommand): Promise<void> {
   }
 }
 
-async function request(operation: BridgeOperation, groupId?: string): Promise<unknown> {
+async function request(operation: BridgeOperation, groupId?: string, offset = 0, before = ""): Promise<unknown> {
   // The spike keeps a modest minimum interval; Phase 3 replaces this with jittered backoff.
   const wait = Math.max(0, 1_000 - (Date.now() - lastRequestAt));
   if (wait) await new Promise((resolve) => window.setTimeout(resolve, wait));
@@ -62,11 +64,11 @@ async function request(operation: BridgeOperation, groupId?: string): Promise<un
 
   url.searchParams.set("ngsw-bypass", "true");
   if (operation === "groups") {
-    Object.entries({ sortOrder: "1", flags: "0", subscriptionTierId: "", listIds: "", search: "", limit: "30", offset: "0" })
+    Object.entries({ sortOrder: "1", flags: "0", subscriptionTierId: "", listIds: "", search: "", limit: "30", offset: String(offset) })
       .forEach(([key, value]) => url.searchParams.set(key, value));
   }
   if (operation === "media") {
-    Object.entries({ locationId: groupId!, locationType: "4001", accountId: await accountId(), mediaType: "", before: "", after: "0", limit: "30", offset: "0" })
+    Object.entries({ locationId: groupId!, locationType: "4001", accountId: await accountId(), mediaType: "", before, after: "0", limit: "30", offset: "0" })
       .forEach(([key, value]) => url.searchParams.set(key, value));
   }
 
@@ -100,17 +102,18 @@ function sanitize(operation: BridgeOperation, json: unknown): unknown {
     return { accountId: String(id) };
   }
   if (operation === "groups") {
-    const groups = findArray(response, ["groups", "data"]);
+    const groups = requiredArray(response, ["groups", "data"], "Chat groups response was malformed");
     return { count: groups.length, groups: groups.slice(0, 30).map(groupSummary).filter(Boolean) };
   }
   const mediaResponse = response as { data?: unknown; aggregationData?: { accountMedia?: unknown } };
-  const data = Array.isArray(mediaResponse?.data) ? mediaResponse.data : [];
-  const media = Array.isArray(mediaResponse?.aggregationData?.accountMedia) ? mediaResponse.aggregationData.accountMedia : [];
+  const data = requiredArray(mediaResponse, ["data"], "MyMedia response was malformed");
+  const media = requiredArray(mediaResponse?.aggregationData, ["accountMedia"], "MyMedia aggregation response was malformed");
   const video = selectDirectVideo(media);
   const dashManifest = selectDashManifest(media);
   const hlsManifest = selectHlsManifest(media);
   return {
     offerCount: data.length,
+    offers: data.map(offerSummary).filter((offer): offer is { id: string } => offer !== null),
     accountMediaCount: media.length,
     // The signed URL is transferred only in-memory to immediately request a
     // Chrome download. It is never rendered, logged, or persisted.
@@ -120,10 +123,15 @@ function sanitize(operation: BridgeOperation, json: unknown): unknown {
   };
 }
 
-function findArray(response: unknown, keys: string[]): unknown[] {
+function requiredArray(response: unknown, keys: string[], message: string): unknown[] {
   const record = response as Record<string, unknown> | undefined;
   for (const key of keys) if (Array.isArray(record?.[key])) return record[key];
-  return [];
+  throw new Error(message);
+}
+
+function offerSummary(value: unknown): { id: string } | null {
+  const id = (value as { id?: unknown })?.id;
+  return typeof id === "string" || typeof id === "number" ? { id: String(id) } : null;
 }
 
 function groupSummary(value: unknown): { groupId: string; partnerUsername: string } | null {
