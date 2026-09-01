@@ -7,7 +7,8 @@ const MEDIA_HOSTS = new Set([
   "media.fansly.com"
 ]);
 
-chrome.runtime.onMessage.addListener((message: unknown, sender, sendResponse) => {
+export function installServiceWorker(): void {
+  chrome.runtime.onMessage.addListener((message: unknown, sender, sendResponse) => {
   if (!message || typeof message !== "object") return;
   const request = message as { type?: unknown; url?: unknown; filename?: unknown };
 
@@ -37,7 +38,8 @@ chrome.runtime.onMessage.addListener((message: unknown, sender, sendResponse) =>
       .catch(() => sendResponse({ ok: false, error: "Chrome could not start that download." }));
     return true;
   }
-});
+  });
+}
 
 function validMediaUrl(value: unknown): URL | null {
   if (typeof value !== "string" || value.length > 8_192) return null;

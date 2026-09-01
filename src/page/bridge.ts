@@ -9,7 +9,8 @@ declare global {
   interface Window { __fanslyMyMediaBridgeInstalled?: boolean; }
 }
 
-if (!window.__fanslyMyMediaBridgeInstalled) {
+export function installBridge(): void {
+  if (window.__fanslyMyMediaBridgeInstalled) return;
   window.__fanslyMyMediaBridgeInstalled = true;
   installSessionHeaderCapture();
 
