@@ -1,3 +1,5 @@
+import { delay, isEmptySuggestion, MAX_EMPTY_SUGGESTION_RETRIES, MAX_RATE_LIMIT_RETRIES, NORMAL_DELAY_MS, randomDelay, RATE_LIMIT_DELAY_MS } from "../core/retry-policy";
+
 const BRIDGE_COMMAND = "fansly-mymedia:command";
 export {};
 const BRIDGE_RESULT = "fansly-mymedia:result";
@@ -52,9 +54,8 @@ async function run(command: BridgeCommand): Promise<void> {
 }
 
 async function request(operation: BridgeOperation, groupId?: string, offset = 0, before = ""): Promise<unknown> {
-  // The spike keeps a modest minimum interval; Phase 3 replaces this with jittered backoff.
-  const wait = Math.max(0, 1_000 - (Date.now() - lastRequestAt));
-  if (wait) await new Promise((resolve) => window.setTimeout(resolve, wait));
+  const wait = Math.max(0, randomDelay(NORMAL_DELAY_MS) - (Date.now() - lastRequestAt));
+  if (wait) await delay(wait);
   lastRequestAt = Date.now();
   const url = new URL(operation === "account"
     ? "https://apiv3.fansly.com/api/v1/account/me"
@@ -75,20 +76,48 @@ async function request(operation: BridgeOperation, groupId?: string, offset = 0,
   if (!sessionHeaders.has("authorization")) {
     throw new Error("Fansly session data is not available yet. Reload the Fansly page, wait for it to finish loading, then try again.");
   }
-  const response = await fetch(url, { credentials: "include", headers: sessionHeaders });
-  if (!response.ok) throw new Error(response.status === 400
-    ? "Fansly rejected the current session request. Reload the Fansly page and try again."
-    : `Fansly request failed (${response.status})`);
-  return sanitize(operation, await response.json());
+  return sanitize(operation, await fetchJsonWithRetry(url, operation === "media"));
+}
+
+async function fetchJsonWithRetry(url: URL, retryEmptySuggestion: boolean): Promise<unknown> {
+  let rateLimitRetries = 0;
+  let emptyRetries = 0;
+  for (;;) {
+    const response = await fetch(url, { credentials: "include", headers: sessionHeaders });
+    if (response.status === 429 && rateLimitRetries < MAX_RATE_LIMIT_RETRIES) {
+      rateLimitRetries += 1;
+      const wait = randomDelay(RATE_LIMIT_DELAY_MS);
+      emitRetry("rate-limit", rateLimitRetries, wait);
+      await delay(wait);
+      continue;
+    }
+    if (!response.ok) throw new Error(response.status === 400
+      ? "Fansly rejected the current session request. Reload the Fansly page and try again."
+      : `Fansly request failed (${response.status})`);
+    const json: unknown = await response.json();
+    if (retryEmptySuggestion && isEmptySuggestion(json)) {
+      if (emptyRetries >= MAX_EMPTY_SUGGESTION_RETRIES) {
+        throw new Error("MyMedia response remained inconclusive after retries.");
+      }
+      emptyRetries += 1;
+      const wait = randomDelay(NORMAL_DELAY_MS);
+      emitRetry("empty-suggestion", emptyRetries, wait);
+      await delay(wait);
+      continue;
+    }
+    return json;
+  }
+}
+
+function emitRetry(reason: "rate-limit" | "empty-suggestion", attempt: number, waitMs: number): void {
+  window.dispatchEvent(new CustomEvent("fansly-mymedia:retry", { detail: { reason, attempt, retryAt: Date.now() + waitMs } }));
 }
 
 async function accountId(): Promise<string> {
   if (!sessionHeaders.has("authorization")) {
     throw new Error("Fansly session data is not available yet. Reload the Fansly page, wait for it to finish loading, then try again.");
   }
-  const response = await fetch("https://apiv3.fansly.com/api/v1/account/me?ngsw-bypass=true", { credentials: "include", headers: sessionHeaders });
-  if (!response.ok) throw new Error(`Account request failed (${response.status})`);
-  const json: unknown = await response.json();
+  const json = await fetchJsonWithRetry(new URL("https://apiv3.fansly.com/api/v1/account/me?ngsw-bypass=true"), false);
   const id = (json as { response?: { account?: { id?: unknown } } }).response?.account?.id;
   if (typeof id !== "string" && typeof id !== "number") throw new Error("Authenticated account ID was missing");
   return String(id);

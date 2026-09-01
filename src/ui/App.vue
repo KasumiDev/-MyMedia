@@ -20,6 +20,12 @@ const dashManifest = ref<Manifest | null>(null);
 const hlsManifest = ref<Manifest | null>(null);
 let activeJob: AbortController | null = null;
 
+window.addEventListener("fansly-mymedia:retry", (event: Event) => {
+  const detail = (event as CustomEvent<{ reason?: string; attempt?: number; retryAt?: number }>).detail;
+  if (!detail?.reason || typeof detail.retryAt !== "number") return;
+  status.value = `Retrying after ${detail.reason} (attempt ${detail.attempt ?? 0}) at ${new Date(detail.retryAt).toLocaleTimeString()}.`;
+});
+
 const validGroupId = (value: string) => /^\d{6,30}$/.test(value);
 
 async function account(): Promise<void> {
