@@ -16,7 +16,9 @@ export default [
     languageOptions: {
       globals: {
         ...globals.browser,
-        ...globals.webextensions
+        ...globals.webextensions,
+        FileSystemDirectoryHandle: "readonly",
+        FileSystemWritableFileStream: "readonly"
       }
     }
   },

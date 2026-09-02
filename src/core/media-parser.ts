@@ -128,12 +128,12 @@ function selectPreferredManifest(media: UnknownRecord): string | null {
       url,
       width: numberFrom(rendition, "width"),
       height: numberFrom(rendition, "height"),
-      formatRank: mimetype === "application/dash+xml" ? 0 : 1
+      formatRank: mimetype === "application/vnd.apple.mpegurl" ? 0 : 1
     }];
   });
 
   manifests.sort((left, right) =>
-    compareQuality(left, right) || left.formatRank - right.formatRank
+    left.formatRank - right.formatRank || compareQuality(left, right)
   );
   return manifests[0]?.url ?? null;
 }

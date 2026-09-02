@@ -3,6 +3,8 @@ export type DownloadState = "queued" | "downloading" | "completed" | "skipped" |
 
 export interface DownloadRecord {
   mediaId: string;
+  accountMediaId?: string;
+  sourceGroupId?: string;
   filename: string;
   originalFilename?: string;
   createdAt?: number;
@@ -235,6 +237,12 @@ async function blobToDataUrl(blob: Blob): Promise<string> {
 function publicRecord(record: StoredDownload): DownloadRecord {
   return {
     mediaId: record.mediaId,
+    ...(record.accountMediaId === undefined
+      ? {}
+      : { accountMediaId: record.accountMediaId }),
+    ...(record.sourceGroupId === undefined
+      ? {}
+      : { sourceGroupId: record.sourceGroupId }),
     filename: record.filename,
     ...(record.originalFilename === undefined
       ? {}
@@ -267,6 +275,8 @@ function parseDownloadRecord(value: unknown): DownloadRecord | null {
   if (value.originalFilename !== undefined && !isSafeOriginalFilename(value.originalFilename)) {
     return null;
   }
+  if (value.accountMediaId !== undefined && !isSafeId(value.accountMediaId)) return null;
+  if (value.sourceGroupId !== undefined && !isSafeGroupId(value.sourceGroupId)) return null;
   if (value.createdAt !== undefined && !isFiniteTimestamp(value.createdAt)) return null;
   if (value.likeCount !== undefined && !isNonNegativeInteger(value.likeCount)) return null;
   if (value.price !== undefined && !isNonNegativeInteger(value.price)) return null;
@@ -278,6 +288,12 @@ function parseDownloadRecord(value: unknown): DownloadRecord | null {
   }
   return {
     mediaId: value.mediaId,
+    ...(value.accountMediaId === undefined
+      ? {}
+      : { accountMediaId: value.accountMediaId }),
+    ...(value.sourceGroupId === undefined
+      ? {}
+      : { sourceGroupId: value.sourceGroupId }),
     filename: value.filename,
     ...(value.originalFilename === undefined
       ? {}
@@ -298,6 +314,10 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function isSafeId(value: unknown): value is string {
   return typeof value === "string" && /^[A-Za-z0-9_-]{1,128}$/.test(value);
+}
+
+function isSafeGroupId(value: unknown): value is string {
+  return typeof value === "string" && /^\d{6,30}$/u.test(value);
 }
 
 function isSafeFilename(value: unknown): value is string {

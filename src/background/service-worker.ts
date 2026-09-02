@@ -4,21 +4,19 @@ import {
   sanitizeOriginalFilename
 } from "../core/filenames";
 import {
+  BROWSER_DOWNLOAD_PROCESSOR_KEY,
+  BROWSER_DOWNLOAD_REVISION_KEY,
+  browserDownloadJobKey,
+  browserDownloadQueueKey,
+  type BrowserDownloadJob
+} from "../core/browser-download";
+import {
   loadDownloadIndex,
   loadDownloadThumbnailDataUrl,
   migrateLegacyDownloadIndex,
-  updateDownloadByChromeId,
-  updateDownloadByMediaId,
   upsertDownloadRecord
 } from "../storage/download-index";
 import { createAndStoreThumbnail } from "../storage/thumbnail-generator";
-import {
-  cancelCompanionDownload,
-  checkCompanion,
-  downloadWithCompanion,
-  getCompanionStatus
-} from "./native-companion";
-import type { CloudFrontAuth } from "../core/native-protocol";
 
 const MEDIA_HOSTS = new Set([
   "cdn1.fansly.com",
@@ -29,25 +27,12 @@ const MEDIA_HOSTS = new Set([
   "media.fansly.com"
 ]);
 const DOWNLOAD_REVISION_KEY = "fansly-mymedia:download-revision";
-const RETRY_STORAGE_PREFIX = "fansly-mymedia:retry:";
 
 type DownloadMetadata = {
   originalFilename: string;
   createdAt: number;
   likeCount: number;
   price: number;
-};
-
-type RetryDownloadInput = {
-  url: string;
-  filename: string;
-  downloadDirectory: string;
-  mediaId: string;
-  previewUrl?: string;
-  manifestUrl?: string;
-  metadata: DownloadMetadata;
-  debug: boolean;
-  userAgent?: string;
 };
 
 export function installServiceWorker(): void {
@@ -62,6 +47,8 @@ export function installServiceWorker(): void {
       url?: unknown;
       filename?: unknown;
       mediaId?: unknown;
+      accountMediaId?: unknown;
+      sourceGroupId?: unknown;
       previewUrl?: unknown;
       manifestUrl?: unknown;
       originalFilename?: unknown;
@@ -69,9 +56,7 @@ export function installServiceWorker(): void {
       likeCount?: unknown;
       price?: unknown;
       debug?: unknown;
-      userAgent?: unknown;
       downloadDirectory?: unknown;
-      mediaIds?: unknown;
     };
 
     if (request.type === "fansly-mymedia:get-download-index") {
@@ -97,57 +82,14 @@ export function installServiceWorker(): void {
       return true;
     }
 
-    if (request.type === "fansly-mymedia:get-companion-status") {
+    if (request.type === "fansly-mymedia:open-download-manager") {
       if (sender.url?.startsWith("https://fansly.com/") !== true) {
-        sendResponse({ ok: false, status: getCompanionStatus() });
-        return;
-      }
-
-      const refresh = (message as { refresh?: unknown }).refresh === true;
-      void checkCompanion(refresh)
-        .then((companionStatus) => sendResponse({ ok: true, status: companionStatus }))
-        .catch(() => sendResponse({ ok: true, status: getCompanionStatus() }));
-      return true;
-    }
-
-    if (request.type === "fansly-mymedia:cancel-companion-download") {
-      const mediaId = validMediaId(request.mediaId);
-      if (!mediaId || sender.url?.startsWith("https://fansly.com/") !== true) {
         sendResponse({ ok: false });
         return;
       }
-
-      void cancelCompanionDownload(mediaId)
-        .then((cancelled) => sendResponse({ ok: cancelled }))
+      void openDownloadManager(true)
+        .then(() => sendResponse({ ok: true }))
         .catch(() => sendResponse({ ok: false }));
-      return true;
-    }
-
-    if (request.type === "fansly-mymedia:retry-download") {
-      const mediaId = validMediaId(request.mediaId);
-      if (!mediaId || sender.url?.startsWith("https://fansly.com/") !== true) {
-        sendResponse({ ok: false, error: "The failed download was invalid." });
-        return;
-      }
-
-      void retryDownload(mediaId)
-        .then((result) => sendResponse({ ok: true, ...result }))
-        .catch((error: unknown) => sendResponse({
-          ok: false,
-          error: error instanceof Error ? error.message : "Retry failed."
-        }));
-      return true;
-    }
-
-    if (request.type === "fansly-mymedia:retry-all-failed") {
-      if (sender.url?.startsWith("https://fansly.com/") !== true) {
-        sendResponse({ ok: false, retried: 0, failed: 0 });
-        return;
-      }
-
-      void retryAllFailed()
-        .then((result) => sendResponse({ ok: true, ...result }))
-        .catch(() => sendResponse({ ok: false, retried: 0, failed: 0 }));
       return true;
     }
 
@@ -163,12 +105,14 @@ export function installServiceWorker(): void {
 
       const filename = validFilename(request.filename);
       const mediaId = validMediaId(request.mediaId);
+      const accountMediaId = validMediaId(request.accountMediaId);
+      const sourceGroupId = validGroupId(request.sourceGroupId);
       const previewUrl = validMediaUrl(request.previewUrl);
       const manifestUrl = validMediaUrl(request.manifestUrl);
       const metadata = validDownloadMetadata(request);
       const downloadDirectory = validDownloadDirectory(request.downloadDirectory);
-      const userAgent = validUserAgent(request.userAgent);
-      if (!filename || !mediaId || !metadata || !downloadDirectory
+      if (!filename || !mediaId || !accountMediaId || !sourceGroupId
+        || !metadata || !downloadDirectory
         || !filename.startsWith(`${downloadDirectory}/`)) {
         sendResponse({
           ok: false,
@@ -177,20 +121,32 @@ export function installServiceWorker(): void {
         return;
       }
 
-      const retryInput: RetryDownloadInput = {
-        url: url.toString(),
-        filename,
-        downloadDirectory,
+      const hlsManifest = manifestUrl && isHlsManifest(manifestUrl)
+        ? manifestUrl
+        : null;
+      const historyFilename = hlsManifest
+        ? filename.replace(/\.[a-z0-9]{1,8}$/iu, ".mp4")
+        : filename;
+      const job: BrowserDownloadJob = {
+        kind: hlsManifest ? "hls" : "direct",
+        sourceUrl: (hlsManifest ?? url).toString(),
+        outputFilename: historyFilename.slice(historyFilename.lastIndexOf("/") + 1),
+        historyFilename,
         mediaId,
-        ...(previewUrl ? { previewUrl: previewUrl.toString() } : {}),
-        ...(manifestUrl ? { manifestUrl: manifestUrl.toString() } : {}),
-        metadata,
-        debug: request.debug === true,
-        ...(userAgent ? { userAgent } : {})
+        accountMediaId,
+        sourceGroupId,
+        ...metadata,
+        debug: request.debug === true
       };
 
-      void storeRetryInput(retryInput)
-        .then(() => startRetryInput(retryInput))
+      void storeBrowserJob(job)
+        .then(() => queueBrowserDownload(job))
+        .then(async (result) => {
+          if (previewUrl) {
+            await createAndStoreThumbnail(mediaId, previewUrl).catch(() => undefined);
+          }
+          return result;
+        })
         .then((result) => sendResponse({ ok: true, ...result }))
         .catch((error: unknown) => sendResponse({
           ok: false,
@@ -202,219 +158,39 @@ export function installServiceWorker(): void {
     }
   });
 
-  chrome.downloads.onChanged.addListener((delta) => {
-    const state = delta.state?.current;
-    if (state !== "complete" && state !== "interrupted") return;
-    void updateDownloadByChromeId(delta.id, (record) => ({
-        ...record,
-        state: state === "complete" ? "completed" : "failed",
-        ...(state === "interrupted"
-          ? { error: delta.error?.current ?? "The browser interrupted the download." }
-          : { error: undefined }),
-        updatedAt: Date.now()
-      }))
-      .then(publishDownloadIndex)
-      .catch(() => {
-        // Storage is best-effort here. Do not interfere with the browser download.
-      });
-  });
 }
 
-async function startPreferredDownload(
-  url: URL,
-  filename: string,
-  mediaId: string,
-  previewUrl: URL | null,
-  manifestUrl: URL | null,
-  metadata: DownloadMetadata,
-  debug: boolean,
-  userAgent: string | null,
-  downloadDirectory: string
-): Promise<{ mode: "browser"; downloadId: number } | { mode: "companion" }> {
-  if (manifestUrl && isStreamingManifest(manifestUrl)) {
-    const companion = await checkCompanion();
-    if (companion.available) {
-      if (!userAgent) {
-        throw new Error("The browser user agent was unavailable.");
-      }
-
-      const nativeHistoryFilename = filename.replace(/\.[a-z0-9]{1,8}$/iu, ".mp4");
-      const cloudFrontAuth = await loadCloudFrontAuth(manifestUrl);
-      await downloadWithCompanion({
-        mediaId,
-        manifestUrl: manifestUrl.toString(),
-        downloadDirectory,
-        outputFilename: nativeHistoryFilename.slice(nativeHistoryFilename.lastIndexOf("/") + 1),
-        historyFilename: nativeHistoryFilename,
-        originalFilename: metadata.originalFilename,
-        createdAt: metadata.createdAt,
-        likeCount: metadata.likeCount,
-        price: metadata.price,
-        ...(debug ? { debug: true } : {}),
-        userAgent,
-        ...(cloudFrontAuth ? { cloudFrontAuth } : {}),
-        ...(previewUrl ? { previewUrl: previewUrl.toString() } : {})
-      });
-      return { mode: "companion" };
-    }
-  }
-
-  const downloadId = await startDownload(url, filename, mediaId, previewUrl, metadata);
-  return { mode: "browser", downloadId };
-}
-
-async function startRetryInput(
-  input: RetryDownloadInput
-): Promise<{ mode: "browser"; downloadId: number } | { mode: "companion" }> {
+async function queueBrowserDownload(
+  input: BrowserDownloadJob
+): Promise<{ mode: "browser-native" }> {
   await upsertDownloadRecord({
     mediaId: input.mediaId,
-    filename: input.filename,
-    ...input.metadata,
+    accountMediaId: input.accountMediaId,
+    sourceGroupId: input.sourceGroupId,
+    filename: input.historyFilename,
+    originalFilename: input.originalFilename,
+    createdAt: input.createdAt,
+    likeCount: input.likeCount,
+    price: input.price,
     state: "queued",
     updatedAt: Date.now()
   });
   await publishDownloadIndex();
 
-  try {
-    return await startPreferredDownload(
-      new URL(input.url),
-      input.filename,
-      input.mediaId,
-      input.previewUrl ? new URL(input.previewUrl) : null,
-      input.manifestUrl ? new URL(input.manifestUrl) : null,
-      input.metadata,
-      input.debug,
-      input.userAgent ?? null,
-      input.downloadDirectory
-    );
-  } catch (error) {
-    const message = error instanceof Error ? error.message : "Download failed.";
-    await updateDownloadByMediaId(input.mediaId, (record) => ({
-      ...record,
-      state: "failed",
-      error: message.slice(0, 500),
-      updatedAt: Date.now()
-    }));
-    await publishDownloadIndex();
-    throw error;
-  }
-}
-
-async function retryDownload(
-  mediaId: string
-): Promise<{ mode: "browser"; downloadId: number } | { mode: "companion" }> {
-  const input = await loadRetryInput(mediaId);
-  if (!input) {
-    throw new Error(
-      "Retry details expired. Rediscover this media and start the download again."
-    );
-  }
-  return startRetryInput(input);
-}
-
-async function retryAllFailed(): Promise<{ retried: number; failed: number }> {
-  const index = await loadDownloadIndex();
-  const failedIds = Object.values(index)
-    .filter((record) => record.state === "failed")
-    .sort((left, right) => left.updatedAt - right.updatedAt)
-    .map((record) => record.mediaId);
-  let retried = 0;
-  let failed = 0;
-
-  for (const mediaId of failedIds) {
-    try {
-      await retryDownload(mediaId);
-      retried += 1;
-    } catch {
-      failed += 1;
-    }
-  }
-
-  return { retried, failed };
-}
-
-async function storeRetryInput(input: RetryDownloadInput): Promise<void> {
   await chrome.storage.session.set({
-    [`${RETRY_STORAGE_PREFIX}${input.mediaId}`]: input
+    [browserDownloadQueueKey(input.mediaId)]: Date.now()
   });
+  await chrome.storage.local.set({
+    [BROWSER_DOWNLOAD_REVISION_KEY]: `${Date.now()}-${crypto.randomUUID()}`
+  });
+  await openDownloadManager(false);
+  return { mode: "browser-native" };
 }
 
-async function loadRetryInput(mediaId: string): Promise<RetryDownloadInput | null> {
-  const key = `${RETRY_STORAGE_PREFIX}${mediaId}`;
-  const stored = await chrome.storage.session.get(key);
-  return parseRetryInput(stored[key]);
-}
-
-function parseRetryInput(value: unknown): RetryDownloadInput | null {
-  if (!value || typeof value !== "object") return null;
-  const input = value as Partial<RetryDownloadInput>;
-  const url = validMediaUrl(input.url);
-  const filename = validFilename(input.filename);
-  const downloadDirectory = validDownloadDirectory(input.downloadDirectory);
-  const mediaId = validMediaId(input.mediaId);
-  const previewUrl = validMediaUrl(input.previewUrl);
-  const manifestUrl = validMediaUrl(input.manifestUrl);
-  const metadata = validDownloadMetadata(input.metadata ?? {});
-  const userAgent = validUserAgent(input.userAgent);
-  if (!url || !filename || !downloadDirectory || !mediaId || !metadata
-    || !filename.startsWith(`${downloadDirectory}/`)) return null;
-
-  return {
-    url: url.toString(),
-    filename,
-    downloadDirectory,
-    mediaId,
-    ...(previewUrl ? { previewUrl: previewUrl.toString() } : {}),
-    ...(manifestUrl ? { manifestUrl: manifestUrl.toString() } : {}),
-    metadata,
-    debug: input.debug === true,
-    ...(userAgent ? { userAgent } : {})
-  };
-}
-
-async function startDownload(
-  url: URL,
-  filename: string,
-  mediaId: string,
-  previewUrl: URL | null,
-  metadata: DownloadMetadata
-): Promise<number> {
-  const downloadId = await chrome.downloads.download({
-    url: url.toString(),
-    filename,
-    conflictAction: "uniquify",
-    saveAs: false
+async function storeBrowserJob(input: BrowserDownloadJob): Promise<void> {
+  await chrome.storage.session.set({
+    [browserDownloadJobKey(input.mediaId)]: input
   });
-
-  // Signed source URLs are deliberately never persisted.
-  await upsertDownloadRecord({
-    mediaId,
-    filename,
-    ...metadata,
-    state: "downloading",
-    chromeDownloadId: downloadId,
-    updatedAt: Date.now()
-  });
-  await publishDownloadIndex();
-
-  if (previewUrl) {
-    await createAndStoreThumbnail(mediaId, previewUrl).catch(() => undefined);
-  }
-
-  const [download] = await chrome.downloads.search({ id: downloadId });
-  if (download?.state === "complete" || download?.state === "interrupted") {
-    await updateDownloadByChromeId(downloadId, (record) => ({
-      ...record,
-      state: download.state === "complete" ? "completed" : "failed",
-      ...(download.state === "interrupted"
-        ? { error: download.error ?? "The browser interrupted the download." }
-        : { error: undefined }),
-      updatedAt: Date.now()
-    }));
-    await publishDownloadIndex();
-  }
-
-  return downloadId;
 }
 
 async function publishDownloadIndex(): Promise<void> {
@@ -431,8 +207,8 @@ function validMediaUrl(value: unknown): URL | null {
   } catch { return null; }
 }
 
-function isStreamingManifest(url: URL): boolean {
-  return /\.(?:m3u8|mpd)$/iu.test(url.pathname);
+function isHlsManifest(url: URL): boolean {
+  return /\.m3u8$/iu.test(url.pathname);
 }
 
 function validFilename(value: unknown): string | null {
@@ -447,40 +223,25 @@ function validMediaId(value: unknown): string | null {
   return typeof value === "string" && /^[a-zA-Z0-9_-]{1,128}$/.test(value) ? value : null;
 }
 
-function validUserAgent(value: unknown): string | null {
-  return typeof value === "string"
-    && value.length > 0
-    && value.length <= 512
-    && !/[\r\n]/u.test(value)
-    ? value
-    : null;
+function validGroupId(value: unknown): string | null {
+  return typeof value === "string" && /^\d{6,30}$/u.test(value) ? value : null;
 }
 
-async function loadCloudFrontAuth(url: URL): Promise<CloudFrontAuth | null> {
-  const cookies = await chrome.cookies.getAll({ url: url.toString() });
-  const byName = new Map(cookies.map((cookie) => [cookie.name, cookie.value]));
-  const keyPairId = byName.get("CloudFront-Key-Pair-Id")
-    ?? url.searchParams.get("Key-Pair-Id");
-  const policy = byName.get("CloudFront-Policy")
-    ?? url.searchParams.get("Policy");
-  const signature = byName.get("CloudFront-Signature")
-    ?? url.searchParams.get("Signature");
+async function openDownloadManager(settingsOnly: boolean): Promise<void> {
+  const baseUrl = chrome.runtime.getURL("download.html");
+  if (settingsOnly) {
+    await chrome.tabs.create({ url: `${baseUrl}?settings=1`, active: true });
+    return;
+  }
 
-  return isSafeCloudFrontValue(keyPairId, 256)
-    && isSafeCloudFrontValue(policy, 8_192)
-    && isSafeCloudFrontValue(signature, 8_192)
-    ? { keyPairId, policy, signature }
-    : null;
-}
+  const stored = await chrome.storage.session.get(BROWSER_DOWNLOAD_PROCESSOR_KEY);
+  const heartbeat = stored[BROWSER_DOWNLOAD_PROCESSOR_KEY];
+  if (typeof heartbeat === "number" && Date.now() - heartbeat < 12_000) return;
 
-function isSafeCloudFrontValue(
-  value: string | null | undefined,
-  maximumLength: number
-): value is string {
-  return typeof value === "string"
-    && value.length > 0
-    && value.length <= maximumLength
-    && !/[;\r\n]/u.test(value);
+  await chrome.storage.session.set({
+    [BROWSER_DOWNLOAD_PROCESSOR_KEY]: Date.now()
+  });
+  await chrome.tabs.create({ url: baseUrl, active: true });
 }
 
 function validDownloadMetadata(value: {

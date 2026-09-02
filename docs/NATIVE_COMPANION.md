@@ -1,4 +1,9 @@
-# Windows native companion
+# Windows native companion (experimental fallback)
+
+> The Chrome extension no longer invokes this companion. Full-quality HLS
+> downloads now run in the extension download-manager page and write directly
+> to a user-selected directory. This document is retained for debugging and
+> possible fallback use only.
 
 The optional native companion downloads user-selected HLS and DASH videos at
 their highest accessible quality. The extension remains the UI; the companion

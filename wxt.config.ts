@@ -5,10 +5,10 @@ export default defineConfig({
   modules: ["@wxt-dev/module-vue"],
   vite: () => ({ plugins: [tailwindcss()] }),
   manifest: ({ browser }) => ({
-    name: "Fansly MyMedia (Feasibility Spike)",
+    name: "Fansly MyMedia",
     version: "0.1.0",
-    description: "Tests authenticated MyMedia access for the currently signed-in Fansly user.",
-    permissions: ["cookies", "downloads", "nativeMessaging", "storage"],
+    description: "Collects and downloads media from the signed-in user's MyMedia library.",
+    permissions: ["storage"],
     host_permissions: [
       "https://fansly.com/*",
       "https://cdn1.fansly.com/*",

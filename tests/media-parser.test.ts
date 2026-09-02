@@ -101,8 +101,8 @@ describe("media previews", () => {
           {
             id: "100000000000000032",
             mimetype: "application/vnd.apple.mpegurl",
-            width: 1920,
-            height: 1080,
+            width: 1280,
+            height: 720,
             locations: [{
               location: "https://cdn3.fansly.com/video/stream.m3u8",
               metadata: {
@@ -115,8 +115,8 @@ describe("media previews", () => {
           {
             id: "100000000000000033",
             mimetype: "application/dash+xml",
-            width: 1280,
-            height: 720,
+            width: 3840,
+            height: 2160,
             locations: [{ location: "https://cdn3.fansly.com/video/stream.mpd" }]
           }
         ]

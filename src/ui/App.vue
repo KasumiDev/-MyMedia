@@ -54,27 +54,15 @@ type DiscoveredMedia = {
 };
 
 type MediaItem = DiscoveredMedia & {
+  sourceGroupId: string;
   state: DownloadState | "ready";
 };
 
 type BridgeResult = {
   ok: boolean;
-  mode?: "browser" | "companion";
+  mode?: "browser" | "browser-native" | "companion";
   payload?: unknown;
   error?: string;
-};
-
-type CompanionStatus = {
-  available: boolean;
-  checking: boolean;
-  version?: string;
-  error?: string;
-  active?: {
-    mediaId: string;
-    percent?: number;
-    totalSize?: number;
-    speed?: number;
-  };
 };
 
 const isOpen = ref(false);
@@ -97,14 +85,9 @@ const downloadDirectory = ref(DEFAULT_DOWNLOAD_DIRECTORY);
 const sortOrder = ref<MediaSortOrder>("created-desc");
 const hoveredMediaId = ref<string | null>(null);
 const focusedMediaId = ref<string | null>(null);
-const companionStatus = ref<CompanionStatus>({
-  available: false,
-  checking: true
-});
 
 let collectionController: AbortController | null = null;
 let pauseDownloadBatch = false;
-let companionStatusTimer: number | null = null;
 
 const imageCount = computed(() => countMedia("image"));
 const videoCount = computed(() => countMedia("video"));
@@ -138,21 +121,12 @@ onMounted(async () => {
   chrome.storage.onChanged.addListener(handleStorageChange);
   await Promise.all([
     refreshDownloadIndex(),
-    loadSettings(),
-    refreshCompanionStatus(false)
+    loadSettings()
   ]);
-  companionStatusTimer = window.setInterval(() => {
-    if (isOpen.value && (isDownloading.value || isSettingsOpen.value)) {
-      void refreshCompanionStatus(false);
-    }
-  }, 1_000);
 });
 
 onBeforeUnmount(() => {
   collectionController?.abort();
-  if (companionStatusTimer !== null) {
-    window.clearInterval(companionStatusTimer);
-  }
   chrome.storage.onChanged.removeListener(handleStorageChange);
 });
 
@@ -186,7 +160,8 @@ async function collectLibrary(): Promise<void> {
         {
           signal: collectionController.signal,
           onPage: (page) => addMedia(
-            page.downloadableMedia as DiscoveredMedia[] | undefined
+            page.downloadableMedia as DiscoveredMedia[] | undefined,
+            group.groupId
           )
         }
       );
@@ -258,10 +233,11 @@ function validInteger(
     : fallback;
 }
 
-function addMedia(items: DiscoveredMedia[] | undefined): void {
+function addMedia(items: DiscoveredMedia[] | undefined, sourceGroupId: string): void {
   if (!items) return;
   const additions: MediaItem[] = items.map((item) => ({
     ...item,
+    sourceGroupId,
     state: downloadIndex.value[item.mediaId]?.state ?? "ready"
   }));
   library.value = mergeUniqueMedia(library.value, additions);
@@ -296,33 +272,7 @@ async function downloadSelected(): Promise<void> {
 
   for (const item of selectedMedia.value) {
     if (pauseDownloadBatch) break;
-    updateItemState(item.mediaId, "queued");
-    const result = await chrome.runtime.sendMessage({
-      type: "fansly-mymedia:download",
-      url: item.url,
-      previewUrl: item.previewUrl ?? (item.kind === "image" ? item.url : null),
-      manifestUrl: item.kind === "video" ? item.manifestUrl : null,
-      filename: buildDownloadFilename({
-        mediaId: item.mediaId,
-        createdAt: item.createdAt,
-        extension: item.extension,
-        downloadDirectory: downloadDirectory.value
-      }),
-      downloadDirectory: downloadDirectory.value,
-      mediaId: item.mediaId,
-      originalFilename: item.originalFilename,
-      createdAt: item.createdAt,
-      likeCount: item.likeCount,
-      price: item.price,
-      debug: companionDebug.value,
-      userAgent: navigator.userAgent
-    }) as BridgeResult;
-    updateItemState(
-      item.mediaId,
-      result.ok
-        ? result.mode === "companion" ? "completed" : "downloading"
-        : "failed"
-    );
+    await queueMediaDownload(item);
   }
 
   isDownloading.value = false;
@@ -332,72 +282,168 @@ async function downloadSelected(): Promise<void> {
 }
 
 async function retryFailed(mediaId: string): Promise<void> {
-  updateItemState(mediaId, "queued");
-  const response = await chrome.runtime.sendMessage({
-    type: "fansly-mymedia:retry-download",
-    mediaId
-  }) as BridgeResult;
-  status.value = response.ok
-    ? "Retry started."
-    : response.error ?? "The download could not be retried.";
-  await refreshDownloadIndex();
+  const record = downloadIndex.value[mediaId];
+  if (!record) return;
+  isDownloading.value = true;
+  status.value = `Refreshing media ${mediaId} before retry…`;
+  try {
+    const refreshed = await rediscoverFailedRecords([record]);
+    const item = refreshed.get(mediaId);
+    if (!item) throw new Error("The media could not be found in its chat.");
+    const response = await queueMediaDownload(item, mediaId);
+    status.value = response.ok
+      ? "Fresh media URL found. Retry queued."
+      : response.error ?? "The download could not be retried.";
+  } catch (error) {
+    status.value = errorMessage(error, "The download could not be rediscovered.");
+  } finally {
+    isDownloading.value = false;
+    await refreshDownloadIndex();
+  }
 }
 
 async function retryAllFailed(): Promise<void> {
   isDownloading.value = true;
   status.value = `Retrying ${failedCount.value} failed downloads…`;
-  const response = await chrome.runtime.sendMessage({
-    type: "fansly-mymedia:retry-all-failed"
-  }) as { ok?: boolean; retried?: number; failed?: number };
-  isDownloading.value = false;
-  await refreshDownloadIndex();
-  status.value = response.ok
-    ? `${response.retried ?? 0} retries completed or started; ${response.failed ?? 0} unavailable.`
-    : "Failed downloads could not be retried.";
-}
-
-async function refreshCompanionStatus(refresh: boolean): Promise<void> {
-  if (refresh) {
-    companionStatus.value = {
-      ...companionStatus.value,
-      checking: true
-    };
-  }
-
-  const response = await chrome.runtime.sendMessage({
-    type: "fansly-mymedia:get-companion-status",
-    refresh
-  }) as { ok?: boolean; status?: CompanionStatus };
-  if (response.ok && response.status) {
-    companionStatus.value = response.status;
+  const records = [...failedRecords.value];
+  let retried = 0;
+  try {
+    const refreshed = await rediscoverFailedRecords(records);
+    for (const record of records) {
+      const item = refreshed.get(record.mediaId);
+      if (!item) continue;
+      const response = await queueMediaDownload(item, record.mediaId);
+      if (response.ok) retried += 1;
+    }
+    status.value = `${retried} retries queued; ${records.length - retried} unavailable.`;
+  } catch (error) {
+    status.value = errorMessage(error, "Failed downloads could not be rediscovered.");
+  } finally {
+    isDownloading.value = false;
+    await refreshDownloadIndex();
   }
 }
 
-async function cancelActiveCompanionDownload(): Promise<void> {
-  const mediaId = companionStatus.value.active?.mediaId;
-  if (!mediaId) {
-    return;
+async function queueMediaDownload(
+  item: MediaItem,
+  historyMediaId = item.mediaId
+): Promise<BridgeResult> {
+  updateItemState(historyMediaId, "queued");
+  const result = await chrome.runtime.sendMessage({
+    type: "fansly-mymedia:download",
+    url: item.url,
+    previewUrl: item.previewUrl ?? (item.kind === "image" ? item.url : null),
+    manifestUrl: item.kind === "video" ? item.manifestUrl : null,
+    filename: buildDownloadFilename({
+      mediaId: historyMediaId,
+      createdAt: item.createdAt,
+      extension: item.extension,
+      downloadDirectory: downloadDirectory.value
+    }),
+    downloadDirectory: downloadDirectory.value,
+    mediaId: historyMediaId,
+    accountMediaId: item.accountMediaId,
+    sourceGroupId: item.sourceGroupId,
+    originalFilename: item.originalFilename,
+    createdAt: item.createdAt,
+    likeCount: item.likeCount,
+    price: item.price,
+    debug: companionDebug.value
+  }) as BridgeResult;
+  updateItemState(historyMediaId, result.ok ? "downloading" : "failed");
+  return result;
+}
+
+async function rediscoverFailedRecords(
+  records: DownloadRecord[]
+): Promise<Map<string, MediaItem>> {
+  const found = new Map<string, MediaItem>();
+  const knownByGroup = new Map<string, DownloadRecord[]>();
+  const unknown: DownloadRecord[] = [];
+
+  for (const record of records) {
+    const current = library.value.find((item) => item.mediaId === record.mediaId);
+    const groupId = record.sourceGroupId ?? current?.sourceGroupId;
+    if (!groupId) {
+      unknown.push(record);
+      continue;
+    }
+    const grouped = knownByGroup.get(groupId) ?? [];
+    grouped.push(record);
+    knownByGroup.set(groupId, grouped);
   }
 
-  const response = await chrome.runtime.sendMessage({
-    type: "fansly-mymedia:cancel-companion-download",
-    mediaId
-  }) as { ok?: boolean };
-  if (response.ok) {
-    status.value = "Cancelling the active full-quality video download…";
+  for (const [groupId, targets] of knownByGroup) {
+    status.value = `Refreshing ${targets.length} failed media from chat ${groupId}…`;
+    const matches = await findMediaInGroup(groupId, targets);
+    for (const [mediaId, item] of matches) found.set(mediaId, item);
+  }
+
+  if (unknown.length > 0) {
+    const retryGroups = await loadRetryGroups();
+    for (const group of retryGroups) {
+      const unresolved = unknown.filter((record) => !found.has(record.mediaId));
+      if (unresolved.length === 0) break;
+      status.value = `Locating ${unresolved.length} failed media in ${group.partnerUsername || group.groupId}…`;
+      const matches = await findMediaInGroup(group.groupId, unresolved);
+      for (const [mediaId, item] of matches) found.set(mediaId, item);
+    }
+  }
+
+  return found;
+}
+
+async function findMediaInGroup(
+  groupId: string,
+  targets: DownloadRecord[]
+): Promise<Map<string, MediaItem>> {
+  const found = new Map<string, MediaItem>();
+  const visited = new Set<string>();
+  let before = "";
+
+  for (;;) {
+    const page = await fetchMedia(groupId, before);
+    const items = (page.downloadableMedia ?? []) as DiscoveredMedia[];
+    for (const record of targets) {
+      if (found.has(record.mediaId)) continue;
+      const current = library.value.find((item) => item.mediaId === record.mediaId);
+      const accountMediaId = record.accountMediaId ?? current?.accountMediaId;
+      const match = items.find((item) => item.mediaId === record.mediaId
+        || (accountMediaId !== undefined && item.accountMediaId === accountMediaId));
+      if (match) {
+        found.set(record.mediaId, {
+          ...match,
+          sourceGroupId: groupId,
+          state: "ready"
+        });
+      }
+    }
+    if (found.size === targets.length || page.offers.length === 0) return found;
+    const next = page.offers.at(-1)?.id;
+    if (!next || visited.has(next)) return found;
+    visited.add(next);
+    before = next;
   }
 }
 
-function companionStatusLabel(): string {
-  if (companionStatus.value.checking) {
-    return "Checking…";
-  }
-  if (companionStatus.value.available) {
-    return companionStatus.value.version
-      ? `Connected · version ${companionStatus.value.version}`
-      : "Connected";
-  }
-  return "Not available";
+async function loadRetryGroups(): Promise<Group[]> {
+  if (groups.value.length > 0) return groups.value;
+  const stored = await chrome.storage.local.get("fansly-mymedia:chats");
+  const value = stored["fansly-mymedia:chats"];
+  if (!Array.isArray(value)) return [];
+  return value.filter((group): group is Group => {
+    if (!group || typeof group !== "object") return false;
+    const candidate = group as Partial<Group>;
+    return typeof candidate.groupId === "string"
+      && /^\d{6,30}$/u.test(candidate.groupId)
+      && typeof candidate.partnerUsername === "string";
+  });
+}
+
+async function openDownloadManager(): Promise<void> {
+  await chrome.runtime.sendMessage({
+    type: "fansly-mymedia:open-download-manager"
+  });
 }
 
 function pauseDownloads(): void {
@@ -410,6 +456,9 @@ function handleStorageChange(
 ): void {
   if (areaName === "local" && changes[DOWNLOAD_REVISION_KEY]) {
     void refreshDownloadIndex();
+  }
+  if (areaName === "local" && changes[SETTINGS_KEY]) {
+    void loadSettings();
   }
 }
 
@@ -621,67 +670,6 @@ function errorMessage(error: unknown, fallback: string): string {
           Limits and delay preferences apply to future collection runs.
         </p>
       </div>
-      <section class="rounded-xl border border-white/10 bg-zinc-900 p-4">
-        <div class="flex items-start gap-3">
-          <span
-            class="mt-1 size-2.5 shrink-0 rounded-full"
-            :class="companionStatus.available ? 'bg-emerald-400' : 'bg-zinc-600'"
-            aria-hidden="true"
-          />
-          <div class="min-w-0 flex-1">
-            <h3 class="text-sm font-medium text-zinc-100">
-              Full-quality video companion
-            </h3>
-            <p class="mt-1 text-xs text-zinc-400">
-              {{ companionStatusLabel() }}
-            </p>
-            <p
-              v-if="companionStatus.error && !companionStatus.available"
-              class="mt-2 text-xs text-amber-300"
-            >
-              {{ companionStatus.error }}
-            </p>
-          </div>
-          <button
-            class="
-              rounded-lg bg-zinc-800 px-3 py-2 text-xs transition
-              hover:bg-zinc-700
-              disabled:cursor-wait disabled:opacity-50
-            "
-            type="button"
-            :disabled="companionStatus.checking"
-            @click="refreshCompanionStatus(true)"
-          >
-            Check connection
-          </button>
-        </div>
-        <div
-          v-if="companionStatus.active"
-          class="mt-4"
-        >
-          <div class="flex justify-between text-xs text-zinc-400">
-            <span>Downloading full-quality video</span>
-            <span>{{ Math.round(companionStatus.active.percent ?? 0) }}%</span>
-          </div>
-          <div class="mt-2 h-1.5 overflow-hidden rounded-full bg-zinc-800">
-            <div
-              class="h-full rounded-full bg-violet-500 transition-all"
-              :style="{ width: `${companionStatus.active.percent ?? 0}%` }"
-            />
-          </div>
-          <button
-            class="
-              mt-3 rounded-lg bg-red-950 px-3 py-2 text-xs text-red-200
-              transition
-              hover:bg-red-900
-            "
-            type="button"
-            @click="cancelActiveCompanionDownload"
-          >
-            Cancel active download
-          </button>
-        </div>
-      </section>
       <label class="grid gap-2 text-sm">
         Chat limit
         <input
@@ -714,19 +702,28 @@ function errorMessage(error: unknown, fallback: string): string {
         >
       </label>
       <label class="grid gap-2 text-sm">
-        Downloads subfolder
+        Download folder
         <input
           v-model="downloadDirectory"
           class="rounded-lg border border-white/10 bg-zinc-900 px-3 py-2"
           type="text"
-          autocomplete="off"
-          placeholder="Fansly MyMedia"
+          readonly
         >
         <span class="text-xs text-zinc-500">
-          Relative to Chrome's and Windows' Downloads folders. Nested paths such
-          as Media/Fansly are supported.
+          Chrome writes media directly to the selected folder without buffering
+          the complete file in memory.
         </span>
       </label>
+      <button
+        class="
+          justify-self-start rounded-lg bg-zinc-800 px-4 py-2 text-sm transition
+          hover:bg-zinc-700
+        "
+        type="button"
+        @click="openDownloadManager"
+      >
+        Choose download folder
+      </button>
       <label
         class="
           flex items-start gap-3 rounded-xl border border-white/10 bg-zinc-900
@@ -740,11 +737,11 @@ function errorMessage(error: unknown, fallback: string): string {
         >
         <span>
           <span class="block text-sm font-medium text-zinc-100">
-            Detailed companion diagnostics
+            Detailed browser diagnostics
           </span>
           <span class="mt-1 block text-xs/5 text-zinc-400">
-            Captures verbose FFprobe and FFmpeg output plus a sanitized manifest
-            response. Signed URL queries and authorization values remain redacted.
+            Captures HLS requests, response metadata, conversion details, and
+            sanitized manifests in the download-manager tab.
           </span>
         </span>
       </label>
