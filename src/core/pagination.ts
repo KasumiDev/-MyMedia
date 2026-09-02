@@ -11,7 +11,12 @@ export interface GroupsPage { groups: ChatGroup[]; }
 
 export async function paginateGroups(
   fetchPage: (offset: number, signal: AbortSignal) => Promise<GroupsPage>,
-  options: { pageSize: number; signal: AbortSignal; onPage?: (page: GroupsPage, offset: number) => void }
+  options: {
+    pageSize: number;
+    signal: AbortSignal;
+    limit?: number;
+    onPage?: (page: GroupsPage, offset: number) => void;
+  }
 ): Promise<ChatGroup[]> {
   const groups: ChatGroup[] = [];
   for (let offset = 0; ; offset += options.pageSize) {
@@ -19,7 +24,11 @@ export async function paginateGroups(
     const page = await fetchPage(offset, options.signal);
     throwIfAborted(options.signal);
     options.onPage?.(page, offset);
-    groups.push(...page.groups);
+    const remaining = options.limit === undefined
+      ? page.groups.length
+      : Math.max(0, options.limit - groups.length);
+    groups.push(...page.groups.slice(0, remaining));
+    if (options.limit !== undefined && groups.length >= options.limit) return groups;
     if (page.groups.length === 0) return groups;
   }
 }

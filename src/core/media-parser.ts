@@ -1,4 +1,4 @@
-import { extensionForMedia } from "./filenames";
+import { extensionForMedia, sanitizeOriginalFilename } from "./filenames";
 
 export type DirectMediaKind = "image" | "video";
 
@@ -10,8 +10,15 @@ export interface DownloadableMedia {
   url: string;
   width: number;
   height: number;
+  createdAt: number;
+  originalFilename: string;
+  likeCount: number;
+  price: number;
   extension: string;
   previewUrl: string | null;
+  stripeUrl: string | null;
+  stripeFrameWidth: number;
+  stripeFrameHeight: number;
 }
 
 export interface ManifestMedia {
@@ -24,6 +31,7 @@ export interface ManifestMedia {
 }
 
 type UnknownRecord = Record<string, unknown>;
+const MAX_PREVIEW_PIXELS = 1_000_000;
 
 /**
  * Selects exactly one highest-resolution direct rendition for every accessible
@@ -57,36 +65,107 @@ export function selectDiagnosticManifest(
 
 function selectAccountMedia(value: unknown): DownloadableMedia[] {
   const record = recordFrom(value);
+  if (!record) return [];
   const accountMediaId = idFrom(record, "id");
-  const media = record?.media;
+  const media = record.media;
   if (!accountMediaId || !isRecord(media)) return [];
+  const rootMimetype = stringFrom(media, "mimetype")?.toLowerCase() ?? "";
+  const rootKind = rootMimetype.startsWith("image/")
+    ? "image"
+    : rootMimetype.startsWith("video/")
+      ? "video"
+      : null;
+  if (!rootKind) return [];
   const candidates: DownloadableMedia[] = [];
+  const previewUrl = selectPreview(media);
+  const stripe = selectVideoStripe(media);
   for (const rendition of renditions(media)) {
     const mimetype = stringFrom(rendition, "mimetype")?.toLowerCase() ?? "";
     const kind = mimetype.startsWith("image/") ? "image" : mimetype.startsWith("video/") ? "video" : null;
     const extension = extensionForMedia(mimetype, stringFrom(rendition, "filename") ?? undefined);
     const url = signedLocation(firstArrayValue(rendition, "locations"));
     const mediaId = idFrom(rendition, "id") ?? idFrom(media, "id");
-    if (!kind || !extension || !url || !mediaId) continue;
-    const previewUrl = selectPreview(media, kind);
-    candidates.push({ accountMediaId, mediaId, kind, mimetype, extension, url, previewUrl, width: numberFrom(rendition, "width"), height: numberFrom(rendition, "height") });
+    if (kind !== rootKind || !extension || !url || !mediaId) continue;
+    candidates.push({
+      accountMediaId,
+      mediaId,
+      kind,
+      mimetype,
+      extension,
+      url,
+      previewUrl,
+      width: numberFrom(rendition, "width"),
+      height: numberFrom(rendition, "height"),
+      createdAt: numberFrom(media, "createdAt"),
+      originalFilename: sanitizeOriginalFilename(
+        stringFrom(media, "filename") ?? "unknown-file"
+      ),
+      likeCount: numberFrom(record, "likeCount"),
+      price: numberFrom(record, "price"),
+      stripeUrl: kind === "video" ? stripe?.url ?? null : null,
+      stripeFrameWidth: kind === "video" ? stripe?.width ?? 0 : 0,
+      stripeFrameHeight: kind === "video" ? stripe?.height ?? 0 : 0
+    });
   }
   candidates.sort(compareQuality);
   return candidates.slice(0, 1);
 }
 
-function selectPreview(media: UnknownRecord, kind: DirectMediaKind): string | null {
-  const previews = renditions(media).filter((item) => {
-    const mime = stringFrom(item, "mimetype") ?? "";
-    return mime.startsWith("image/") && (kind === "video" || numberFrom(item, "height") <= 480);
+function selectPreview(media: UnknownRecord): string | null {
+  const previews = variants(media).flatMap((item) => {
+    const mimetype = stringFrom(item, "mimetype")?.toLowerCase() ?? "";
+    const width = numberFrom(item, "width");
+    const height = numberFrom(item, "height");
+    const url = signedLocation(firstArrayValue(item, "locations"));
+    const type = numberFrom(item, "type");
+    const isPreview = type !== 3 && type !== 4;
+    const isReasonableSize = width > 0
+      && height > 0
+      && width * height <= MAX_PREVIEW_PIXELS;
+
+    return mimetype.startsWith("image/") && isPreview && isReasonableSize && url
+      ? [{ url, width, height }]
+      : [];
   });
-  previews.sort((a, b) => numberFrom(b, "height") - numberFrom(a, "height"));
-  return previews.map((item) => signedLocation(firstArrayValue(item, "locations"))).find((url): url is string => url !== null) ?? null;
+
+  previews.sort(comparePreviewSize);
+  return previews[0]?.url ?? null;
+}
+
+function selectVideoStripe(
+  media: UnknownRecord
+): { url: string; width: number; height: number } | null {
+  const stripes = variants(media).flatMap((item) => {
+    const mimetype = stringFrom(item, "mimetype")?.toLowerCase() ?? "";
+    const width = numberFrom(item, "width");
+    const height = numberFrom(item, "height");
+    const url = signedLocation(firstArrayValue(item, "locations"));
+    return numberFrom(item, "type") === 4
+      && mimetype.startsWith("image/")
+      && width > 0
+      && height > 0
+      && url
+      ? [{ url, width, height }]
+      : [];
+  });
+  stripes.sort(comparePreviewSize);
+  return stripes[0] ?? null;
 }
 
 function renditions(media: UnknownRecord): UnknownRecord[] {
-  const variants = Array.isArray(media.variants) ? media.variants.filter(isRecord) : [];
-  return [media, ...variants];
+  return [media, ...variants(media)];
+}
+
+function variants(media: UnknownRecord): UnknownRecord[] {
+  return Array.isArray(media.variants) ? media.variants.filter(isRecord) : [];
+}
+
+function comparePreviewSize(
+  left: { width: number; height: number },
+  right: { width: number; height: number }
+): number {
+  const pixelDifference = left.width * left.height - right.width * right.height;
+  return pixelDifference || left.width - right.width || left.height - right.height;
 }
 
 function compareQuality(left: { width: number; height: number }, right: { width: number; height: number }): number {

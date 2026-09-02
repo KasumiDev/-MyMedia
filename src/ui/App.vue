@@ -1,17 +1,28 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 import { TabsContent, TabsList, TabsRoot, TabsTrigger } from "reka-ui";
-import { buildDownloadFilename } from "../core/filenames";
+import {
+  buildDownloadFilename,
+  formatMediaCreatedAt
+} from "../core/filenames";
 import { mergeUniqueMedia } from "../core/media-library";
+import {
+  isMediaSortOrder,
+  sortMedia,
+  type MediaSortOrder
+} from "../core/media-sort";
 import { paginateGroups, paginateMedia } from "../core/pagination";
 import type {
   DownloadIndex,
   DownloadRecord,
   DownloadState
 } from "../storage/download-index";
-import { loadDownloadIndex } from "../storage/download-index";
+import DownloadThumbnail from "./DownloadThumbnail.vue";
+import VideoStripePreview from "./VideoStripePreview.vue";
 
-const DOWNLOAD_INDEX_KEY = "fansly-mymedia:download-index";
+const DOWNLOAD_REVISION_KEY = "fansly-mymedia:download-revision";
+const SETTINGS_KEY = "fansly-mymedia:settings";
+const DEFAULT_CHAT_LIMIT = 10;
 
 type Group = {
   groupId: string;
@@ -29,10 +40,17 @@ type DiscoveredMedia = {
   previewUrl: string | null;
   width: number;
   height: number;
+  createdAt: number;
+  originalFilename: string;
+  likeCount: number;
+  price: number;
+  stripeUrl: string | null;
+  stripeFrameWidth: number;
+  stripeFrameHeight: number;
   extension: string;
 };
 
-type MediaItem = DiscoveredMedia & Group & {
+type MediaItem = DiscoveredMedia & {
   state: DownloadState | "ready";
 };
 
@@ -54,17 +72,22 @@ const selectedIds = ref(new Set<string>());
 const downloadIndex = ref<DownloadIndex>({});
 const status = ref("Open MyMedia to begin collecting your library.");
 const currentChat = ref(0);
+const chatLimit = ref(DEFAULT_CHAT_LIMIT);
 const minDelay = ref(1);
 const maxDelay = ref(5);
+const sortOrder = ref<MediaSortOrder>("created-desc");
+const hoveredMediaId = ref<string | null>(null);
+const focusedMediaId = ref<string | null>(null);
 
 let collectionController: AbortController | null = null;
 let pauseDownloadBatch = false;
 
 const imageCount = computed(() => countMedia("image"));
 const videoCount = computed(() => countMedia("video"));
-const downloadedRecords = computed(() => Object.values(downloadIndex.value)
-  .filter((record) => record.state === "completed")
-  .sort((left, right) => right.updatedAt - left.updatedAt));
+const downloadedRecords = computed(() => sortMedia(
+  Object.values(downloadIndex.value).filter((record) => record.state === "completed"),
+  sortOrder.value
+));
 const downloadedCount = computed(() => downloadedRecords.value.length);
 const collectionProgress = computed(() => groups.value.length === 0
   ? 0
@@ -72,15 +95,18 @@ const collectionProgress = computed(() => groups.value.length === 0
 
 const visibleMedia = computed(() => {
   if (activeTab.value === "downloaded") return [];
-  return library.value.filter((item) => item.kind === activeTab.value && !isCompleted(item));
+  return sortMedia(
+    library.value.filter((item) => item.kind === activeTab.value && !isCompleted(item)),
+    sortOrder.value
+  );
 });
 
 const selectedMedia = computed(() => library.value.filter((item) =>
   selectedIds.value.has(item.mediaId) && item.state === "ready"));
 
 onMounted(async () => {
-  downloadIndex.value = await loadDownloadIndex();
   chrome.storage.onChanged.addListener(handleStorageChange);
+  await Promise.all([refreshDownloadIndex(), loadSettings()]);
 });
 
 onBeforeUnmount(() => {
@@ -104,6 +130,7 @@ async function collectLibrary(): Promise<void> {
   try {
     groups.value = await paginateGroups(fetchGroups, {
       pageSize: 30,
+      limit: chatLimit.value,
       signal: collectionController.signal
     });
     await chrome.storage.local.set({ "fansly-mymedia:chats": groups.value });
@@ -117,8 +144,7 @@ async function collectLibrary(): Promise<void> {
         {
           signal: collectionController.signal,
           onPage: (page) => addMedia(
-            page.downloadableMedia as DiscoveredMedia[] | undefined,
-            group
+            page.downloadableMedia as DiscoveredMedia[] | undefined
           )
         }
       );
@@ -141,11 +167,52 @@ function pauseCollection(): void {
   isCollectionPaused.value = true;
 }
 
-function addMedia(items: DiscoveredMedia[] | undefined, group: Group): void {
+async function loadSettings(): Promise<void> {
+  const stored = await chrome.storage.local.get(SETTINGS_KEY);
+  const settings = stored[SETTINGS_KEY] as {
+    chatLimit?: unknown;
+    minDelay?: unknown;
+    maxDelay?: unknown;
+    sortOrder?: unknown;
+  } | undefined;
+  chatLimit.value = validInteger(settings?.chatLimit, 1, 100_000, DEFAULT_CHAT_LIMIT);
+  minDelay.value = validInteger(settings?.minDelay, 1, 300, 1);
+  maxDelay.value = validInteger(settings?.maxDelay, minDelay.value, 300, 5);
+  sortOrder.value = isMediaSortOrder(settings?.sortOrder)
+    ? settings.sortOrder
+    : "created-desc";
+}
+
+async function saveSettings(): Promise<void> {
+  chatLimit.value = validInteger(chatLimit.value, 1, 100_000, DEFAULT_CHAT_LIMIT);
+  minDelay.value = validInteger(minDelay.value, 1, 300, 1);
+  maxDelay.value = validInteger(maxDelay.value, minDelay.value, 300, 5);
+  await chrome.storage.local.set({
+    [SETTINGS_KEY]: {
+      chatLimit: chatLimit.value,
+      minDelay: minDelay.value,
+      maxDelay: maxDelay.value,
+      sortOrder: sortOrder.value
+    }
+  });
+  status.value = `Settings saved. The next collection will process up to ${chatLimit.value} chats.`;
+}
+
+function validInteger(
+  value: unknown,
+  minimum: number,
+  maximum: number,
+  fallback: number
+): number {
+  return typeof value === "number" && Number.isInteger(value)
+    ? Math.min(maximum, Math.max(minimum, value))
+    : fallback;
+}
+
+function addMedia(items: DiscoveredMedia[] | undefined): void {
   if (!items) return;
   const additions: MediaItem[] = items.map((item) => ({
     ...item,
-    ...group,
     state: downloadIndex.value[item.mediaId]?.state ?? "ready"
   }));
   library.value = mergeUniqueMedia(library.value, additions);
@@ -156,6 +223,10 @@ function toggleSelection(id: string): void {
   if (next.has(id)) next.delete(id);
   else next.add(id);
   selectedIds.value = next;
+}
+
+function toggleCardFromKeyboard(item: MediaItem): void {
+  if (item.state === "ready") toggleSelection(item.mediaId);
 }
 
 function selectVisible(): void {
@@ -180,13 +251,17 @@ async function downloadSelected(): Promise<void> {
     const result = await chrome.runtime.sendMessage({
       type: "fansly-mymedia:download",
       url: item.url,
+      previewUrl: item.previewUrl ?? (item.kind === "image" ? item.url : null),
       filename: buildDownloadFilename({
-        partnerUsername: item.partnerUsername,
-        groupId: item.groupId,
-        accountMediaId: item.accountMediaId,
+        mediaId: item.mediaId,
+        createdAt: item.createdAt,
         extension: item.extension
       }),
-      mediaId: item.mediaId
+      mediaId: item.mediaId,
+      originalFilename: item.originalFilename,
+      createdAt: item.createdAt,
+      likeCount: item.likeCount,
+      price: item.price
     }) as BridgeResult;
     updateItemState(item.mediaId, result.ok ? "downloading" : "failed");
   }
@@ -205,8 +280,17 @@ function handleStorageChange(
   changes: Record<string, chrome.storage.StorageChange>,
   areaName: string
 ): void {
-  if (areaName !== "local" || !changes[DOWNLOAD_INDEX_KEY]) return;
-  downloadIndex.value = (changes[DOWNLOAD_INDEX_KEY].newValue ?? {}) as DownloadIndex;
+  if (areaName === "local" && changes[DOWNLOAD_REVISION_KEY]) {
+    void refreshDownloadIndex();
+  }
+}
+
+async function refreshDownloadIndex(): Promise<void> {
+  const response = await chrome.runtime.sendMessage({
+    type: "fansly-mymedia:get-download-index"
+  }) as { ok?: boolean; index?: DownloadIndex };
+  if (!response.ok || !response.index) return;
+  downloadIndex.value = response.index;
   for (const item of library.value) {
     const state = downloadIndex.value[item.mediaId]?.state;
     if (state) item.state = state;
@@ -229,6 +313,29 @@ function isCompleted(item: MediaItem): boolean {
 
 function displayedFilename(record: DownloadRecord): string {
   return record.filename.replace(/^Fansly MyMedia\//, "");
+}
+
+function displayedOriginalFilename(record: DownloadRecord): string {
+  return record.originalFilename ?? displayedFilename(record);
+}
+
+function displayCreatedAt(createdAt: number | undefined): string {
+  return createdAt === undefined ? "Unknown date" : formatMediaCreatedAt(createdAt);
+}
+
+function displayPrice(price: number | undefined): string {
+  return price === undefined ? "Unknown price" : `$${(price / 100).toFixed(2)}`;
+}
+
+async function saveSortOrder(): Promise<void> {
+  const stored = await chrome.storage.local.get(SETTINGS_KEY);
+  const settings = stored[SETTINGS_KEY];
+  await chrome.storage.local.set({
+    [SETTINGS_KEY]: {
+      ...(typeof settings === "object" && settings !== null ? settings : {}),
+      sortOrder: sortOrder.value
+    }
+  });
 }
 
 function downloadedKind(record: DownloadRecord): "Image" | "Video" | "Media" {
@@ -378,9 +485,22 @@ function errorMessage(error: unknown, fallback: string): string {
           Collection settings
         </h2>
         <p class="mt-1 text-sm text-zinc-400">
-          Delay preferences for future collection runs.
+          Limits and delay preferences apply to future collection runs.
         </p>
       </div>
+      <label class="grid gap-2 text-sm">
+        Chat limit
+        <input
+          v-model.number="chatLimit"
+          class="rounded-lg border border-white/10 bg-zinc-900 px-3 py-2"
+          type="number"
+          min="1"
+          max="100000"
+        >
+        <span class="text-xs text-zinc-500">
+          Only the first {{ chatLimit }} chats will be scanned for media.
+        </span>
+      </label>
       <label class="grid gap-2 text-sm">
         Minimum delay (seconds)
         <input
@@ -399,6 +519,17 @@ function errorMessage(error: unknown, fallback: string): string {
           min="1"
         >
       </label>
+      <button
+        class="
+          justify-self-start rounded-lg bg-violet-600 px-4 py-2 text-sm
+          font-medium transition
+          hover:bg-violet-500
+        "
+        type="button"
+        @click="saveSettings"
+      >
+        Save settings
+      </button>
     </div>
 
     <template v-else>
@@ -462,6 +593,24 @@ function errorMessage(error: unknown, fallback: string): string {
           >
             Downloaded <span class="ml-1 text-xs">{{ downloadedCount }}</span>
           </TabsTrigger>
+          <label class="ml-auto flex items-center gap-2 text-xs text-zinc-400">
+            Sort
+            <select
+              v-model="sortOrder"
+              class="
+                rounded-lg border border-white/10 bg-zinc-900 px-3 py-2 text-sm
+                text-zinc-200
+              "
+              @change="saveSortOrder"
+            >
+              <option value="created-desc">Newest first</option>
+              <option value="created-asc">Oldest first</option>
+              <option value="price-desc">Price: high to low</option>
+              <option value="price-asc">Price: low to high</option>
+              <option value="likes-desc">Likes: high to low</option>
+              <option value="likes-asc">Likes: low to high</option>
+            </select>
+          </label>
         </TabsList>
 
         <TabsContent
@@ -482,20 +631,25 @@ function errorMessage(error: unknown, fallback: string): string {
                 bg-zinc-900 p-4
               "
             >
-              <div
-                class="
-                  grid size-12 shrink-0 place-items-center rounded-lg
-                  bg-emerald-500/10 text-xs font-semibold text-emerald-300
-                "
-              >
-                {{ downloadedKind(record) }}
-              </div>
+              <DownloadThumbnail
+                :media-id="record.mediaId"
+                :kind="downloadedKind(record)"
+              />
               <div class="min-w-0 flex-1">
                 <p class="truncate text-sm font-medium text-zinc-100">
+                  {{ displayedOriginalFilename(record) }}
+                </p>
+                <p class="mt-1 truncate text-xs text-zinc-500">
                   {{ displayedFilename(record) }}
                 </p>
-                <p class="mt-1 text-xs text-zinc-500">
-                  Downloaded {{ new Date(record.updatedAt).toLocaleString() }}
+                <p
+                  class="
+                    mt-2 flex flex-wrap gap-x-4 gap-y-1 text-xs text-zinc-400
+                  "
+                >
+                  <span>{{ displayCreatedAt(record.createdAt) }}</span>
+                  <span>{{ displayPrice(record.price) }}</span>
+                  <span>{{ record.likeCount ?? "—" }} likes</span>
                 </p>
               </div>
               <span
@@ -512,18 +666,41 @@ function errorMessage(error: unknown, fallback: string): string {
             v-else-if="tab !== 'downloaded' && visibleMedia.length"
             class="grid grid-cols-[repeat(auto-fill,minmax(180px,1fr))] gap-4"
           >
-            <label
+            <button
               v-for="item in visibleMedia"
               :key="item.mediaId"
               class="
                 group overflow-hidden rounded-xl border border-white/10
-                bg-zinc-900 transition
+                bg-zinc-900 transition outline-none
                 hover:border-violet-400/60
+                focus-visible:border-violet-400 focus-visible:ring-2
+                focus-visible:ring-violet-400/40
               "
+              type="button"
+              role="checkbox"
+              :aria-checked="selectedIds.has(item.mediaId)"
+              :aria-disabled="item.state !== 'ready'"
+              :tabindex="item.state === 'ready' ? 0 : -1"
+              @pointerenter="hoveredMediaId = item.mediaId"
+              @pointerleave="hoveredMediaId = null"
+              @focus="focusedMediaId = item.mediaId"
+              @blur="focusedMediaId = null"
+              @click="toggleCardFromKeyboard(item)"
             >
               <div class="relative aspect-square bg-zinc-800">
+                <VideoStripePreview
+                  v-if="item.kind === 'video'"
+                  :preview-url="item.previewUrl"
+                  :stripe-url="item.stripeUrl"
+                  :frame-width="item.stripeFrameWidth"
+                  :frame-height="item.stripeFrameHeight"
+                  :active="
+                    hoveredMediaId === item.mediaId
+                      || focusedMediaId === item.mediaId
+                  "
+                />
                 <img
-                  v-if="item.previewUrl"
+                  v-else-if="item.previewUrl"
                   class="size-full object-cover"
                   :src="item.previewUrl"
                   loading="lazy"
@@ -534,15 +711,21 @@ function errorMessage(error: unknown, fallback: string): string {
                   class="
                     grid size-full place-items-center text-sm text-zinc-500
                   "
-                >No preview</div>
-                <input
-                  v-if="activeTab !== 'downloaded'"
-                  class="absolute top-3 left-3 size-5 accent-violet-500"
-                  type="checkbox"
-                  :checked="selectedIds.has(item.mediaId)"
-                  :disabled="item.state !== 'ready'"
-                  @change="toggleSelection(item.mediaId)"
                 >
+                  No preview
+                </div>
+                <span
+                  class="
+                    absolute top-3 left-3 grid size-5 place-items-center
+                    rounded-sm border border-white/70 text-xs text-white
+                  "
+                  :class="selectedIds.has(item.mediaId)
+                    ? 'bg-violet-600'
+                    : 'bg-black/50'"
+                  aria-hidden="true"
+                >
+                  {{ selectedIds.has(item.mediaId) ? "✓" : "" }}
+                </span>
                 <span
                   v-if="item.kind === 'video'"
                   class="
@@ -553,14 +736,14 @@ function errorMessage(error: unknown, fallback: string): string {
               </div>
               <div
                 class="
-                  flex items-center justify-between gap-2 p-3 text-xs
-                  text-zinc-400
+                  grid grid-cols-3 gap-2 p-3 text-center text-xs text-zinc-400
                 "
               >
-                <span>{{ item.width }}×{{ item.height }}</span>
-                <span class="capitalize">{{ item.state }}</span>
+                <span>{{ displayCreatedAt(item.createdAt) }}</span>
+                <span>{{ displayPrice(item.price) }}</span>
+                <span>{{ item.likeCount }} likes</span>
               </div>
-            </label>
+            </button>
           </div>
           <div
             v-else

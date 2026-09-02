@@ -12,6 +12,26 @@ describe("pagination", () => {
     expect(result).toHaveLength(1);
   });
 
+  it("stops group discovery at the configured chat limit", async () => {
+    const offsets: number[] = [];
+    const result = await paginateGroups(async (offset) => {
+      offsets.push(offset);
+      return {
+        groups: Array.from({ length: 30 }, (_, index) => ({
+          groupId: String(offset + index + 1),
+          partnerUsername: `creator-${offset + index + 1}`
+        }))
+      };
+    }, {
+      pageSize: 30,
+      limit: 10,
+      signal: new AbortController().signal
+    });
+
+    expect(offsets).toEqual([0]);
+    expect(result).toHaveLength(10);
+  });
+
   it("starts media pagination at an empty cursor and advances from final offer", async () => {
     const cursors: string[] = [];
     await paginateMedia(async (before) => {
