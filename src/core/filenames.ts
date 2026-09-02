@@ -75,5 +75,5 @@ export function buildDownloadFilename(input: DownloadFilenameInput): string {
 
 export function isValidDownloadFilename(value: unknown): value is string {
   if (typeof value !== "string" || value.length > 240) return false;
-  return /^Fansly MyMedia\/[a-zA-Z0-9][a-zA-Z0-9 ._-]{0,79}-\d{6,30}-\d{6,30}\.[a-z0-9]{1,8}$/.test(value);
+  return /^Fansly MyMedia\/[^<>:"/\\|?*\r\n]{1,220}\.[a-z0-9]{1,8}$/u.test(value);
 }

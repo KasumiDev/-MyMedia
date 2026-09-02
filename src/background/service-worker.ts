@@ -13,39 +13,42 @@ const MEDIA_HOSTS = new Set([
 
 export function installServiceWorker(): void {
   chrome.runtime.onMessage.addListener((message: unknown, sender, sendResponse) => {
-  if (!message || typeof message !== "object") return;
-  const request = message as { type?: unknown; url?: unknown; filename?: unknown; mediaId?: unknown };
+    if (!message || typeof message !== "object") return;
+    const request = message as {
+      type?: unknown;
+      url?: unknown;
+      filename?: unknown;
+      mediaId?: unknown;
+    };
 
-  if (request.type === "fansly-mymedia:download") {
-    const url = validMediaUrl(request.url);
-    if (!url || sender.url?.startsWith("https://fansly.com/") !== true) {
-      sendResponse({ ok: false, error: "Only an approved Fansly media URL can be downloaded." });
-      return;
+    if (request.type === "fansly-mymedia:download") {
+      const url = validMediaUrl(request.url);
+      if (!url || sender.url?.startsWith("https://fansly.com/") !== true) {
+        sendResponse({
+          ok: false,
+          error: "Only an approved Fansly media URL can be downloaded."
+        });
+        return;
+      }
+
+      const filename = validFilename(request.filename);
+      const mediaId = validMediaId(request.mediaId);
+      if (!filename || !mediaId) {
+        sendResponse({
+          ok: false,
+          error: "The media filename or identifier was invalid."
+        });
+        return;
+      }
+
+      void startDownload(url, filename, mediaId)
+        .then((downloadId) => sendResponse({ ok: true, downloadId }))
+        .catch(() => sendResponse({
+          ok: false,
+          error: "The browser could not start that download."
+        }));
+      return true;
     }
-    const filename = validFilename(request.filename) ?? "Fansly MyMedia/feasibility-download";
-    void chrome.downloads.download({
-      url: url.toString(),
-      filename,
-      conflictAction: "uniquify",
-      saveAs: false
-    }).then((downloadId) => {
-      // Do not persist url: it may contain temporary access signatures.
-      const mediaId = validMediaId(request.mediaId) ?? `download-${downloadId}`;
-      void upsertDownloadRecord({
-        mediaId,
-        filename,
-        state: "downloading",
-        chromeDownloadId: downloadId,
-        updatedAt: Date.now()
-      }).catch(() => {
-        // The download itself succeeded; a transient storage failure must not
-        // make the user believe otherwise.
-      });
-      sendResponse({ ok: true, downloadId });
-    })
-      .catch(() => sendResponse({ ok: false, error: "Chrome could not start that download." }));
-    return true;
-  }
   });
 
   chrome.downloads.onChanged.addListener((delta) => {
@@ -54,12 +57,50 @@ export function installServiceWorker(): void {
     void updateDownloadByChromeId(delta.id, (record) => ({
       ...record,
       state: state === "complete" ? "completed" : "failed",
-      ...(state === "interrupted" ? { error: delta.error?.current ?? "Chrome download was interrupted." } : { error: undefined }),
+      ...(state === "interrupted"
+        ? { error: delta.error?.current ?? "The browser interrupted the download." }
+        : { error: undefined }),
       updatedAt: Date.now()
     })).catch(() => {
-      // Storage is best-effort here. Do not interfere with Chrome's download.
+      // Storage is best-effort here. Do not interfere with the browser download.
     });
   });
+}
+
+async function startDownload(
+  url: URL,
+  filename: string,
+  mediaId: string
+): Promise<number> {
+  const downloadId = await chrome.downloads.download({
+    url: url.toString(),
+    filename,
+    conflictAction: "uniquify",
+    saveAs: false
+  });
+
+  // Signed source URLs are deliberately never persisted.
+  await upsertDownloadRecord({
+    mediaId,
+    filename,
+    state: "downloading",
+    chromeDownloadId: downloadId,
+    updatedAt: Date.now()
+  });
+
+  const [download] = await chrome.downloads.search({ id: downloadId });
+  if (download?.state === "complete" || download?.state === "interrupted") {
+    await updateDownloadByChromeId(downloadId, (record) => ({
+      ...record,
+      state: download.state === "complete" ? "completed" : "failed",
+      ...(download.state === "interrupted"
+        ? { error: download.error ?? "The browser interrupted the download." }
+        : { error: undefined }),
+      updatedAt: Date.now()
+    }));
+  }
+
+  return downloadId;
 }
 
 function validMediaUrl(value: unknown): URL | null {

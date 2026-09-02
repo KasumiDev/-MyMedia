@@ -14,6 +14,7 @@ export type DownloadIndex = Record<string, DownloadRecord>;
 
 const DOWNLOAD_INDEX_KEY = "fansly-mymedia:download-index";
 const MAX_RECORDS = 100_000;
+let writeQueue: Promise<void> = Promise.resolve();
 
 export async function loadDownloadIndex(): Promise<DownloadIndex> {
   const stored = await chrome.storage.local.get(DOWNLOAD_INDEX_KEY);
@@ -27,8 +28,10 @@ export async function getDownloadRecord(mediaId: string): Promise<DownloadRecord
 export async function upsertDownloadRecord(record: DownloadRecord): Promise<void> {
   const valid = parseDownloadRecord(record);
   if (!valid) throw new Error("Refusing to persist an invalid download record.");
-  const index = await loadDownloadIndex();
-  await chrome.storage.local.set({ [DOWNLOAD_INDEX_KEY]: { ...index, [valid.mediaId]: valid } });
+  await updateDownloadIndex((index) => ({
+    ...index,
+    [valid.mediaId]: valid
+  }));
 }
 
 export async function updateDownloadByChromeId(
@@ -36,19 +39,39 @@ export async function updateDownloadByChromeId(
   update: (record: DownloadRecord) => DownloadRecord
 ): Promise<DownloadRecord | null> {
   if (!Number.isInteger(chromeDownloadId) || chromeDownloadId < 0) return null;
-  const index = await loadDownloadIndex();
-  const key = Object.keys(index).find((mediaId) => index[mediaId]?.chromeDownloadId === chromeDownloadId);
-  if (!key) return null;
-  const current = index[key];
-  if (!current) return null;
-  const next = parseDownloadRecord(update(current));
-  if (!next) throw new Error("Refusing to persist an invalid download update.");
-  await chrome.storage.local.set({ [DOWNLOAD_INDEX_KEY]: { ...index, [key]: next } });
-  return next;
+  let updatedRecord: DownloadRecord | null = null;
+  await updateDownloadIndex((index) => {
+    const key = Object.keys(index).find(
+      (mediaId) => index[mediaId]?.chromeDownloadId === chromeDownloadId
+    );
+    if (!key) return index;
+    const current = index[key];
+    if (!current) return index;
+    const next = parseDownloadRecord(update(current));
+    if (!next) throw new Error("Refusing to persist an invalid download update.");
+    updatedRecord = next;
+    return { ...index, [key]: next };
+  });
+  return updatedRecord;
 }
 
 export async function clearDownloadIndex(): Promise<void> {
-  await chrome.storage.local.remove(DOWNLOAD_INDEX_KEY);
+  await enqueueWrite(() => chrome.storage.local.remove(DOWNLOAD_INDEX_KEY));
+}
+
+async function updateDownloadIndex(
+  update: (index: DownloadIndex) => DownloadIndex
+): Promise<void> {
+  await enqueueWrite(async () => {
+    const index = await loadDownloadIndex();
+    await chrome.storage.local.set({ [DOWNLOAD_INDEX_KEY]: update(index) });
+  });
+}
+
+async function enqueueWrite(write: () => Promise<void>): Promise<void> {
+  const pending = writeQueue.then(write, write);
+  writeQueue = pending.catch(() => undefined);
+  await pending;
 }
 
 function parseDownloadIndex(value: unknown): DownloadIndex {

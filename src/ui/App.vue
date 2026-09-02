@@ -1,8 +1,14 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 import { TabsContent, TabsList, TabsRoot, TabsTrigger } from "reka-ui";
+import { buildDownloadFilename } from "../core/filenames";
+import { mergeUniqueMedia } from "../core/media-library";
 import { paginateGroups, paginateMedia } from "../core/pagination";
-import type { DownloadIndex, DownloadState } from "../storage/download-index";
+import type {
+  DownloadIndex,
+  DownloadRecord,
+  DownloadState
+} from "../storage/download-index";
 import { loadDownloadIndex } from "../storage/download-index";
 
 const DOWNLOAD_INDEX_KEY = "fansly-mymedia:download-index";
@@ -26,7 +32,7 @@ type DiscoveredMedia = {
   extension: string;
 };
 
-type MediaItem = DiscoveredMedia & {
+type MediaItem = DiscoveredMedia & Group & {
   state: DownloadState | "ready";
 };
 
@@ -56,18 +62,21 @@ let pauseDownloadBatch = false;
 
 const imageCount = computed(() => countMedia("image"));
 const videoCount = computed(() => countMedia("video"));
-const downloadedCount = computed(() => library.value.filter(isCompleted).length);
+const downloadedRecords = computed(() => Object.values(downloadIndex.value)
+  .filter((record) => record.state === "completed")
+  .sort((left, right) => right.updatedAt - left.updatedAt));
+const downloadedCount = computed(() => downloadedRecords.value.length);
 const collectionProgress = computed(() => groups.value.length === 0
   ? 0
   : Math.round((currentChat.value / groups.value.length) * 100));
 
 const visibleMedia = computed(() => {
-  if (activeTab.value === "downloaded") return library.value.filter(isCompleted);
+  if (activeTab.value === "downloaded") return [];
   return library.value.filter((item) => item.kind === activeTab.value && !isCompleted(item));
 });
 
 const selectedMedia = computed(() => library.value.filter((item) =>
-  selectedIds.value.has(item.accountMediaId) && item.state === "ready"));
+  selectedIds.value.has(item.mediaId) && item.state === "ready"));
 
 onMounted(async () => {
   downloadIndex.value = await loadDownloadIndex();
@@ -107,7 +116,10 @@ async function collectLibrary(): Promise<void> {
         (before) => fetchMedia(group.groupId, before),
         {
           signal: collectionController.signal,
-          onPage: (page) => addMedia(page.downloadableMedia as DiscoveredMedia[] | undefined)
+          onPage: (page) => addMedia(
+            page.downloadableMedia as DiscoveredMedia[] | undefined,
+            group
+          )
         }
       );
     }
@@ -129,16 +141,14 @@ function pauseCollection(): void {
   isCollectionPaused.value = true;
 }
 
-function addMedia(items: DiscoveredMedia[] | undefined): void {
+function addMedia(items: DiscoveredMedia[] | undefined, group: Group): void {
   if (!items) return;
-  const knownIds = new Set(library.value.map((item) => item.accountMediaId));
-  const additions: MediaItem[] = items
-    .filter((item) => !knownIds.has(item.accountMediaId))
-    .map((item) => ({
-      ...item,
-      state: downloadIndex.value[item.mediaId]?.state ?? "ready"
-    }));
-  library.value.push(...additions);
+  const additions: MediaItem[] = items.map((item) => ({
+    ...item,
+    ...group,
+    state: downloadIndex.value[item.mediaId]?.state ?? "ready"
+  }));
+  library.value = mergeUniqueMedia(library.value, additions);
 }
 
 function toggleSelection(id: string): void {
@@ -151,7 +161,7 @@ function toggleSelection(id: string): void {
 function selectVisible(): void {
   const next = new Set(selectedIds.value);
   for (const item of visibleMedia.value) {
-    if (item.state === "ready") next.add(item.accountMediaId);
+    if (item.state === "ready") next.add(item.mediaId);
   }
   selectedIds.value = next;
 }
@@ -170,7 +180,12 @@ async function downloadSelected(): Promise<void> {
     const result = await chrome.runtime.sendMessage({
       type: "fansly-mymedia:download",
       url: item.url,
-      filename: `Fansly MyMedia/${item.accountMediaId}.${item.extension}`,
+      filename: buildDownloadFilename({
+        partnerUsername: item.partnerUsername,
+        groupId: item.groupId,
+        accountMediaId: item.accountMediaId,
+        extension: item.extension
+      }),
       mediaId: item.mediaId
     }) as BridgeResult;
     updateItemState(item.mediaId, result.ok ? "downloading" : "failed");
@@ -195,7 +210,7 @@ function handleStorageChange(
   for (const item of library.value) {
     const state = downloadIndex.value[item.mediaId]?.state;
     if (state) item.state = state;
-    if (state === "completed") selectedIds.value.delete(item.accountMediaId);
+    if (state === "completed") selectedIds.value.delete(item.mediaId);
   }
 }
 
@@ -210,6 +225,21 @@ function countMedia(kind: MediaKind): number {
 
 function isCompleted(item: MediaItem): boolean {
   return item.state === "completed";
+}
+
+function displayedFilename(record: DownloadRecord): string {
+  return record.filename.replace(/^Fansly MyMedia\//, "");
+}
+
+function downloadedKind(record: DownloadRecord): "Image" | "Video" | "Media" {
+  const extension = record.filename.split(".").pop()?.toLowerCase();
+  if (["jpeg", "jpg", "png", "gif", "webp", "avif"].includes(extension ?? "")) {
+    return "Image";
+  }
+  if (["mp4", "m4v", "webm", "mov"].includes(extension ?? "")) {
+    return "Video";
+  }
+  return "Media";
 }
 
 async function fetchGroups(offset: number): Promise<{ groups: Group[] }> {
@@ -441,12 +471,50 @@ function errorMessage(error: unknown, fallback: string): string {
           class="min-h-0 flex-1 overflow-auto p-6"
         >
           <div
-            v-if="visibleMedia.length"
+            v-if="tab === 'downloaded' && downloadedRecords.length"
+            class="grid gap-3"
+          >
+            <article
+              v-for="record in downloadedRecords"
+              :key="record.mediaId"
+              class="
+                flex items-center gap-4 rounded-xl border border-white/10
+                bg-zinc-900 p-4
+              "
+            >
+              <div
+                class="
+                  grid size-12 shrink-0 place-items-center rounded-lg
+                  bg-emerald-500/10 text-xs font-semibold text-emerald-300
+                "
+              >
+                {{ downloadedKind(record) }}
+              </div>
+              <div class="min-w-0 flex-1">
+                <p class="truncate text-sm font-medium text-zinc-100">
+                  {{ displayedFilename(record) }}
+                </p>
+                <p class="mt-1 text-xs text-zinc-500">
+                  Downloaded {{ new Date(record.updatedAt).toLocaleString() }}
+                </p>
+              </div>
+              <span
+                class="
+                  rounded-full bg-emerald-500/10 px-3 py-1 text-xs
+                  text-emerald-300
+                "
+              >
+                Completed
+              </span>
+            </article>
+          </div>
+          <div
+            v-else-if="tab !== 'downloaded' && visibleMedia.length"
             class="grid grid-cols-[repeat(auto-fill,minmax(180px,1fr))] gap-4"
           >
             <label
               v-for="item in visibleMedia"
-              :key="item.accountMediaId"
+              :key="item.mediaId"
               class="
                 group overflow-hidden rounded-xl border border-white/10
                 bg-zinc-900 transition
@@ -471,9 +539,9 @@ function errorMessage(error: unknown, fallback: string): string {
                   v-if="activeTab !== 'downloaded'"
                   class="absolute top-3 left-3 size-5 accent-violet-500"
                   type="checkbox"
-                  :checked="selectedIds.has(item.accountMediaId)"
+                  :checked="selectedIds.has(item.mediaId)"
                   :disabled="item.state !== 'ready'"
-                  @change="toggleSelection(item.accountMediaId)"
+                  @change="toggleSelection(item.mediaId)"
                 >
                 <span
                   v-if="item.kind === 'video'"
@@ -500,7 +568,13 @@ function errorMessage(error: unknown, fallback: string): string {
               grid h-full min-h-56 place-items-center text-sm text-zinc-500
             "
           >
-            {{ isCollecting ? "Media will appear here as it is discovered." : "Nothing here yet." }}
+            {{
+              tab === "downloaded"
+                ? "No completed downloads are stored yet."
+                : isCollecting
+                  ? "Media will appear here as it is discovered."
+                  : "Nothing here yet."
+            }}
           </div>
         </TabsContent>
       </TabsRoot>
