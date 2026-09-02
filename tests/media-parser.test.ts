@@ -84,6 +84,51 @@ describe("media previews", () => {
       stripeFrameHeight: 90
     });
   });
+
+  it("associates the best signed streaming manifest with its direct video", () => {
+    const media = selectDownloadableMedia([{
+      id: "100000000000000030",
+      media: {
+        id: "100000000000000031",
+        type: 2,
+        mimetype: "video/mp4",
+        filename: "video.mp4",
+        createdAt: 1_700_000_000,
+        width: 1280,
+        height: 720,
+        locations: [{ location: "https://cdn3.fansly.com/video.mp4" }],
+        variants: [
+          {
+            id: "100000000000000032",
+            mimetype: "application/vnd.apple.mpegurl",
+            width: 1920,
+            height: 1080,
+            locations: [{
+              location: "https://cdn3.fansly.com/video/stream.m3u8",
+              metadata: {
+                Policy: "policy",
+                Signature: "signature",
+                "Key-Pair-Id": "key"
+              }
+            }]
+          },
+          {
+            id: "100000000000000033",
+            mimetype: "application/dash+xml",
+            width: 1280,
+            height: 720,
+            locations: [{ location: "https://cdn3.fansly.com/video/stream.mpd" }]
+          }
+        ]
+      }
+    }]);
+
+    const manifest = new URL(media[0]?.manifestUrl ?? "");
+    expect(manifest.pathname).toBe("/video/stream.m3u8");
+    expect(manifest.searchParams.get("Policy")).toBe("policy");
+    expect(manifest.searchParams.get("Signature")).toBe("signature");
+    expect(manifest.searchParams.get("Key-Pair-Id")).toBe("key");
+  });
 });
 
 function imageVariant(

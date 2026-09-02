@@ -48,6 +48,7 @@ type DiscoveredMedia = {
   stripeFrameWidth: number;
   stripeFrameHeight: number;
   extension: string;
+  manifestUrl: string | null;
 };
 
 type MediaItem = DiscoveredMedia & {
@@ -56,8 +57,22 @@ type MediaItem = DiscoveredMedia & {
 
 type BridgeResult = {
   ok: boolean;
+  mode?: "browser" | "companion";
   payload?: unknown;
   error?: string;
+};
+
+type CompanionStatus = {
+  available: boolean;
+  checking: boolean;
+  version?: string;
+  error?: string;
+  active?: {
+    mediaId: string;
+    percent?: number;
+    totalSize?: number;
+    speed?: number;
+  };
 };
 
 const isOpen = ref(false);
@@ -78,9 +93,14 @@ const maxDelay = ref(5);
 const sortOrder = ref<MediaSortOrder>("created-desc");
 const hoveredMediaId = ref<string | null>(null);
 const focusedMediaId = ref<string | null>(null);
+const companionStatus = ref<CompanionStatus>({
+  available: false,
+  checking: true
+});
 
 let collectionController: AbortController | null = null;
 let pauseDownloadBatch = false;
+let companionStatusTimer: number | null = null;
 
 const imageCount = computed(() => countMedia("image"));
 const videoCount = computed(() => countMedia("video"));
@@ -106,11 +126,23 @@ const selectedMedia = computed(() => library.value.filter((item) =>
 
 onMounted(async () => {
   chrome.storage.onChanged.addListener(handleStorageChange);
-  await Promise.all([refreshDownloadIndex(), loadSettings()]);
+  await Promise.all([
+    refreshDownloadIndex(),
+    loadSettings(),
+    refreshCompanionStatus(false)
+  ]);
+  companionStatusTimer = window.setInterval(() => {
+    if (isOpen.value && (isDownloading.value || isSettingsOpen.value)) {
+      void refreshCompanionStatus(false);
+    }
+  }, 1_000);
 });
 
 onBeforeUnmount(() => {
   collectionController?.abort();
+  if (companionStatusTimer !== null) {
+    window.clearInterval(companionStatusTimer);
+  }
   chrome.storage.onChanged.removeListener(handleStorageChange);
 });
 
@@ -252,6 +284,7 @@ async function downloadSelected(): Promise<void> {
       type: "fansly-mymedia:download",
       url: item.url,
       previewUrl: item.previewUrl ?? (item.kind === "image" ? item.url : null),
+      manifestUrl: item.kind === "video" ? item.manifestUrl : null,
       filename: buildDownloadFilename({
         mediaId: item.mediaId,
         createdAt: item.createdAt,
@@ -263,13 +296,62 @@ async function downloadSelected(): Promise<void> {
       likeCount: item.likeCount,
       price: item.price
     }) as BridgeResult;
-    updateItemState(item.mediaId, result.ok ? "downloading" : "failed");
+    updateItemState(
+      item.mediaId,
+      result.ok
+        ? result.mode === "companion" ? "completed" : "downloading"
+        : "failed"
+    );
   }
 
   isDownloading.value = false;
   status.value = pauseDownloadBatch
     ? "Download batch paused. Downloads already started continue in Chrome."
     : "Selected downloads submitted. Completed files move to Downloaded automatically.";
+}
+
+async function refreshCompanionStatus(refresh: boolean): Promise<void> {
+  if (refresh) {
+    companionStatus.value = {
+      ...companionStatus.value,
+      checking: true
+    };
+  }
+
+  const response = await chrome.runtime.sendMessage({
+    type: "fansly-mymedia:get-companion-status",
+    refresh
+  }) as { ok?: boolean; status?: CompanionStatus };
+  if (response.ok && response.status) {
+    companionStatus.value = response.status;
+  }
+}
+
+async function cancelActiveCompanionDownload(): Promise<void> {
+  const mediaId = companionStatus.value.active?.mediaId;
+  if (!mediaId) {
+    return;
+  }
+
+  const response = await chrome.runtime.sendMessage({
+    type: "fansly-mymedia:cancel-companion-download",
+    mediaId
+  }) as { ok?: boolean };
+  if (response.ok) {
+    status.value = "Cancelling the active full-quality video download…";
+  }
+}
+
+function companionStatusLabel(): string {
+  if (companionStatus.value.checking) {
+    return "Checking…";
+  }
+  if (companionStatus.value.available) {
+    return companionStatus.value.version
+      ? `Connected · version ${companionStatus.value.version}`
+      : "Connected";
+  }
+  return "Not available";
 }
 
 function pauseDownloads(): void {
@@ -488,6 +570,67 @@ function errorMessage(error: unknown, fallback: string): string {
           Limits and delay preferences apply to future collection runs.
         </p>
       </div>
+      <section class="rounded-xl border border-white/10 bg-zinc-900 p-4">
+        <div class="flex items-start gap-3">
+          <span
+            class="mt-1 size-2.5 shrink-0 rounded-full"
+            :class="companionStatus.available ? 'bg-emerald-400' : 'bg-zinc-600'"
+            aria-hidden="true"
+          />
+          <div class="min-w-0 flex-1">
+            <h3 class="text-sm font-medium text-zinc-100">
+              Full-quality video companion
+            </h3>
+            <p class="mt-1 text-xs text-zinc-400">
+              {{ companionStatusLabel() }}
+            </p>
+            <p
+              v-if="companionStatus.error && !companionStatus.available"
+              class="mt-2 text-xs text-amber-300"
+            >
+              {{ companionStatus.error }}
+            </p>
+          </div>
+          <button
+            class="
+              rounded-lg bg-zinc-800 px-3 py-2 text-xs transition
+              hover:bg-zinc-700
+              disabled:cursor-wait disabled:opacity-50
+            "
+            type="button"
+            :disabled="companionStatus.checking"
+            @click="refreshCompanionStatus(true)"
+          >
+            Check connection
+          </button>
+        </div>
+        <div
+          v-if="companionStatus.active"
+          class="mt-4"
+        >
+          <div class="flex justify-between text-xs text-zinc-400">
+            <span>Downloading full-quality video</span>
+            <span>{{ Math.round(companionStatus.active.percent ?? 0) }}%</span>
+          </div>
+          <div class="mt-2 h-1.5 overflow-hidden rounded-full bg-zinc-800">
+            <div
+              class="h-full rounded-full bg-violet-500 transition-all"
+              :style="{ width: `${companionStatus.active.percent ?? 0}%` }"
+            />
+          </div>
+          <button
+            class="
+              mt-3 rounded-lg bg-red-950 px-3 py-2 text-xs text-red-200
+              transition
+              hover:bg-red-900
+            "
+            type="button"
+            @click="cancelActiveCompanionDownload"
+          >
+            Cancel active download
+          </button>
+        </div>
+      </section>
       <label class="grid gap-2 text-sm">
         Chat limit
         <input

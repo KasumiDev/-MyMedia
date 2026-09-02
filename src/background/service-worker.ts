@@ -10,6 +10,12 @@ import {
   upsertDownloadRecord
 } from "../storage/download-index";
 import { createAndStoreThumbnail } from "../storage/thumbnail-generator";
+import {
+  cancelCompanionDownload,
+  checkCompanion,
+  downloadWithCompanion,
+  getCompanionStatus
+} from "./native-companion";
 
 const MEDIA_HOSTS = new Set([
   "cdn1.fansly.com",
@@ -41,6 +47,7 @@ export function installServiceWorker(): void {
       filename?: unknown;
       mediaId?: unknown;
       previewUrl?: unknown;
+      manifestUrl?: unknown;
       originalFilename?: unknown;
       createdAt?: unknown;
       likeCount?: unknown;
@@ -70,6 +77,32 @@ export function installServiceWorker(): void {
       return true;
     }
 
+    if (request.type === "fansly-mymedia:get-companion-status") {
+      if (sender.url?.startsWith("https://fansly.com/") !== true) {
+        sendResponse({ ok: false, status: getCompanionStatus() });
+        return;
+      }
+
+      const refresh = (message as { refresh?: unknown }).refresh === true;
+      void checkCompanion(refresh)
+        .then((companionStatus) => sendResponse({ ok: true, status: companionStatus }))
+        .catch(() => sendResponse({ ok: true, status: getCompanionStatus() }));
+      return true;
+    }
+
+    if (request.type === "fansly-mymedia:cancel-companion-download") {
+      const mediaId = validMediaId(request.mediaId);
+      if (!mediaId || sender.url?.startsWith("https://fansly.com/") !== true) {
+        sendResponse({ ok: false });
+        return;
+      }
+
+      void cancelCompanionDownload(mediaId)
+        .then((cancelled) => sendResponse({ ok: cancelled }))
+        .catch(() => sendResponse({ ok: false }));
+      return true;
+    }
+
     if (request.type === "fansly-mymedia:download") {
       const url = validMediaUrl(request.url);
       if (!url || sender.url?.startsWith("https://fansly.com/") !== true) {
@@ -83,6 +116,7 @@ export function installServiceWorker(): void {
       const filename = validFilename(request.filename);
       const mediaId = validMediaId(request.mediaId);
       const previewUrl = validMediaUrl(request.previewUrl);
+      const manifestUrl = validMediaUrl(request.manifestUrl);
       const metadata = validDownloadMetadata(request);
       if (!filename || !mediaId || !metadata) {
         sendResponse({
@@ -92,11 +126,18 @@ export function installServiceWorker(): void {
         return;
       }
 
-      void startDownload(url, filename, mediaId, previewUrl, metadata)
-        .then((downloadId) => sendResponse({ ok: true, downloadId }))
+      void startPreferredDownload(
+        url,
+        filename,
+        mediaId,
+        previewUrl,
+        manifestUrl,
+        metadata
+      )
+        .then((result) => sendResponse({ ok: true, ...result }))
         .catch(() => sendResponse({
           ok: false,
-          error: "The browser could not start that download."
+          error: "The download could not be completed."
         }));
       return true;
     }
@@ -118,6 +159,37 @@ export function installServiceWorker(): void {
         // Storage is best-effort here. Do not interfere with the browser download.
       });
   });
+}
+
+async function startPreferredDownload(
+  url: URL,
+  filename: string,
+  mediaId: string,
+  previewUrl: URL | null,
+  manifestUrl: URL | null,
+  metadata: DownloadMetadata
+): Promise<{ mode: "browser"; downloadId: number } | { mode: "companion" }> {
+  if (manifestUrl && isStreamingManifest(manifestUrl)) {
+    const companion = await checkCompanion();
+    if (companion.available) {
+      const nativeHistoryFilename = filename.replace(/\.[a-z0-9]{1,8}$/iu, ".mp4");
+      await downloadWithCompanion({
+        mediaId,
+        manifestUrl: manifestUrl.toString(),
+        outputFilename: nativeHistoryFilename.replace(/^Fansly MyMedia\//u, ""),
+        historyFilename: nativeHistoryFilename,
+        originalFilename: metadata.originalFilename,
+        createdAt: metadata.createdAt,
+        likeCount: metadata.likeCount,
+        price: metadata.price,
+        ...(previewUrl ? { previewUrl: previewUrl.toString() } : {})
+      });
+      return { mode: "companion" };
+    }
+  }
+
+  const downloadId = await startDownload(url, filename, mediaId, previewUrl, metadata);
+  return { mode: "browser", downloadId };
 }
 
 async function startDownload(
@@ -177,6 +249,10 @@ function validMediaUrl(value: unknown): URL | null {
     const url = new URL(value);
     return url.protocol === "https:" && MEDIA_HOSTS.has(url.hostname) ? url : null;
   } catch { return null; }
+}
+
+function isStreamingManifest(url: URL): boolean {
+  return /\.(?:m3u8|mpd)$/iu.test(url.pathname);
 }
 
 function validFilename(value: unknown): string | null {

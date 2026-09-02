@@ -19,6 +19,7 @@ export interface DownloadableMedia {
   stripeUrl: string | null;
   stripeFrameWidth: number;
   stripeFrameHeight: number;
+  manifestUrl: string | null;
 }
 
 export interface ManifestMedia {
@@ -35,7 +36,8 @@ const MAX_PREVIEW_PIXELS = 1_000_000;
 
 /**
  * Selects exactly one highest-resolution direct rendition for every accessible
- * account-media record. HLS/DASH manifests are intentionally excluded.
+ * account-media record. A video's preferred streaming manifest is associated
+ * in-memory so the companion can retrieve its full-quality representation.
  */
 export function selectDownloadableMedia(accountMedia: unknown[]): DownloadableMedia[] {
   return accountMedia.flatMap(selectAccountMedia).sort((left, right) =>
@@ -79,6 +81,7 @@ function selectAccountMedia(value: unknown): DownloadableMedia[] {
   const candidates: DownloadableMedia[] = [];
   const previewUrl = selectPreview(media);
   const stripe = selectVideoStripe(media);
+  const manifestUrl = rootKind === "video" ? selectPreferredManifest(media) : null;
   for (const rendition of renditions(media)) {
     const mimetype = stringFrom(rendition, "mimetype")?.toLowerCase() ?? "";
     const kind = mimetype.startsWith("image/") ? "image" : mimetype.startsWith("video/") ? "video" : null;
@@ -104,11 +107,35 @@ function selectAccountMedia(value: unknown): DownloadableMedia[] {
       price: numberFrom(record, "price"),
       stripeUrl: kind === "video" ? stripe?.url ?? null : null,
       stripeFrameWidth: kind === "video" ? stripe?.width ?? 0 : 0,
-      stripeFrameHeight: kind === "video" ? stripe?.height ?? 0 : 0
+      stripeFrameHeight: kind === "video" ? stripe?.height ?? 0 : 0,
+      manifestUrl: kind === "video" ? manifestUrl : null
     });
   }
   candidates.sort(compareQuality);
   return candidates.slice(0, 1);
+}
+
+function selectPreferredManifest(media: UnknownRecord): string | null {
+  const manifests = renditions(media).flatMap((rendition) => {
+    const mimetype = stringFrom(rendition, "mimetype")?.toLowerCase();
+    const url = signedLocation(firstArrayValue(rendition, "locations"));
+    if (!url || (mimetype !== "application/dash+xml"
+      && mimetype !== "application/vnd.apple.mpegurl")) {
+      return [];
+    }
+
+    return [{
+      url,
+      width: numberFrom(rendition, "width"),
+      height: numberFrom(rendition, "height"),
+      formatRank: mimetype === "application/dash+xml" ? 0 : 1
+    }];
+  });
+
+  manifests.sort((left, right) =>
+    compareQuality(left, right) || left.formatRank - right.formatRank
+  );
+  return manifests[0]?.url ?? null;
 }
 
 function selectPreview(media: UnknownRecord): string | null {

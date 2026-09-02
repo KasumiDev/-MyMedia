@@ -69,6 +69,32 @@ export async function updateDownloadByChromeId(
   return updated;
 }
 
+export async function updateDownloadByMediaId(
+  mediaId: string,
+  update: (record: DownloadRecord) => DownloadRecord
+): Promise<DownloadRecord | null> {
+  if (!isSafeId(mediaId)) {
+    return null;
+  }
+
+  let updated: DownloadRecord | null = null;
+  await enqueueWrite(async () => {
+    const current = await readDownload(mediaId);
+    if (!current) {
+      return;
+    }
+
+    const valid = parseDownloadRecord(update(publicRecord(current)));
+    if (!valid) {
+      throw new Error("Refusing to persist an invalid download update.");
+    }
+
+    await putDownload({ ...current, ...valid });
+    updated = valid;
+  });
+  return updated;
+}
+
 export async function storeDownloadThumbnail(mediaId: string, thumbnail: Blob): Promise<void> {
   if (!isSafeId(mediaId) || !thumbnail.type.startsWith("image/") || thumbnail.size > 50_000) {
     throw new Error("Refusing to persist an invalid download thumbnail.");
