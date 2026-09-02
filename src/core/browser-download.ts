@@ -1,6 +1,5 @@
 export const BROWSER_DOWNLOAD_JOB_PREFIX = "fansly-mymedia:browser-job:";
 export const BROWSER_DOWNLOAD_QUEUE_PREFIX = "fansly-mymedia:browser-queued:";
-export const BROWSER_DOWNLOAD_PROCESSOR_KEY = "fansly-mymedia:browser-processor";
 export const BROWSER_DOWNLOAD_REVISION_KEY = "fansly-mymedia:browser-download-revision";
 
 export type BrowserDownloadKind = "direct" | "hls";

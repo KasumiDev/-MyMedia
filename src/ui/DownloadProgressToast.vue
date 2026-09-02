@@ -11,23 +11,19 @@ import {
 import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 
 import {
-  BROWSER_DOWNLOAD_PROCESSOR_KEY,
   BROWSER_DOWNLOAD_QUEUE_PREFIX,
   BROWSER_DOWNLOAD_REVISION_KEY,
   browserDownloadJobKey,
   browserDownloadQueueKey,
   type BrowserDownloadJob
-} from "../../src/core/browser-download";
-import { sanitizeFilenameComponent } from "../../src/core/filenames";
+} from "../core/browser-download";
+import { sanitizeFilenameComponent } from "../core/filenames";
 import {
   authorizeHlsRequestUrl,
   preferMuxedHlsAudio
-} from "../../src/core/hls-request";
-import {
-  loadDownloadDirectoryHandle,
-  saveDownloadDirectoryHandle
-} from "../../src/storage/download-directory";
-import { upsertDownloadRecord } from "../../src/storage/download-index";
+} from "../core/hls-request";
+import { loadDownloadDirectoryHandle } from "../storage/download-directory";
+import { upsertDownloadRecord } from "../storage/download-index";
 
 const SETTINGS_KEY = "fansly-mymedia:settings";
 const DOWNLOAD_REVISION_KEY = "fansly-mymedia:download-revision";
@@ -40,7 +36,10 @@ type PermissionHandle = FileSystemDirectoryHandle & {
   requestPermission(options?: { mode?: "read" | "readwrite" }): Promise<PermissionState>;
 };
 
-const folderName = ref<string | null>(null);
+const emit = defineEmits<{
+  folderRequired: [];
+}>();
+
 const status = ref("Waiting for download jobs…");
 const progress = ref(0);
 const activeJob = ref<BrowserDownloadJob | null>(null);
@@ -48,7 +47,11 @@ const paused = ref(false);
 const running = ref(false);
 const logs = ref<string[]>([]);
 const queueLength = ref(0);
-const settingsOnly = new URLSearchParams(window.location.search).get("settings") === "1";
+const toastVisible = ref(false);
+const batchTotal = ref(0);
+const batchProcessed = ref(0);
+const batchFailed = ref(0);
+const lastFilename = ref<string | null>(null);
 
 let directoryHandle: FileSystemDirectoryHandle | null = null;
 let conversion: Conversion | null = null;
@@ -57,7 +60,6 @@ let pauseController: AbortController | null = null;
 let processPromise: Promise<void> | null = null;
 let resumeResolver: (() => void) | null = null;
 let disposed = false;
-let heartbeatTimer: number | null = null;
 let cancelRequested = false;
 
 type HlsAudioMode = "muxed" | "primary" | "alternate" | "none";
@@ -77,70 +79,36 @@ class MissingAlternateAudioError extends Error {
 }
 
 const debugEnabled = computed(() => activeJob.value?.debug === true);
+const batchProgress = computed(() => batchTotal.value > 0
+  ? Math.round((batchProcessed.value / batchTotal.value) * 100)
+  : 0);
 
 onMounted(async () => {
   directoryHandle = await loadDownloadDirectoryHandle();
-  folderName.value = directoryHandle?.name ?? null;
-  if (settingsOnly) {
-    status.value = "Choose the folder where files should be stored.";
-    return;
-  }
-  await chrome.storage.session.set({
-    [BROWSER_DOWNLOAD_PROCESSOR_KEY]: Date.now()
-  });
-  heartbeatTimer = window.setInterval(() => {
-    void chrome.storage.session.set({
-      [BROWSER_DOWNLOAD_PROCESSOR_KEY]: Date.now()
-    });
-  }, 5_000);
   chrome.storage.onChanged.addListener(handleStorageChange);
   await refreshQueueLength();
+  registerQueueState();
   void processQueue();
 });
 
 onBeforeUnmount(() => {
   disposed = true;
-  if (heartbeatTimer !== null) window.clearInterval(heartbeatTimer);
   chrome.storage.onChanged.removeListener(handleStorageChange);
-  if (!settingsOnly) {
-    void chrome.storage.session.remove(BROWSER_DOWNLOAD_PROCESSOR_KEY);
-  }
   void conversion?.cancel();
 });
-
-async function chooseFolder(): Promise<void> {
-  const picker = window as unknown as Window & {
-    showDirectoryPicker(options?: {
-      id?: string;
-      mode?: "read" | "readwrite";
-      startIn?: "downloads";
-    }): Promise<FileSystemDirectoryHandle>;
-  };
-  try {
-    const handle = await picker.showDirectoryPicker({
-      id: "fansly-mymedia-downloads",
-      mode: "readwrite",
-      startIn: "downloads"
-    });
-    await saveDownloadDirectoryHandle(handle);
-    directoryHandle = handle;
-    folderName.value = handle.name;
-    await saveFolderName(handle.name);
-    status.value = `Downloads will be saved directly in ${handle.name}.`;
-    if (!settingsOnly) void processQueue();
-  } catch (error) {
-    if (!(error instanceof DOMException && error.name === "AbortError")) {
-      status.value = error instanceof Error
-        ? error.message
-        : "Chrome could not open the selected folder.";
-    }
-  }
-}
 
 async function processQueue(): Promise<void> {
   if (processPromise || disposed) return;
   processPromise = runQueue().finally(() => {
     processPromise = null;
+    if (!disposed) {
+      void refreshQueueLength().then(() => {
+        if (queueLength.value > 0) {
+          registerQueueState();
+          void processQueue();
+        }
+      });
+    }
   });
   await processPromise;
 }
@@ -149,14 +117,21 @@ async function runQueue(): Promise<void> {
   while (!disposed) {
     const job = await takeNextJob();
     if (!job) {
-      status.value = directoryHandle
-        ? "Waiting for download jobs…"
-        : "Choose a download folder to begin.";
+      if (batchTotal.value > 0 && batchProcessed.value >= batchTotal.value) {
+        status.value = batchFailed.value > 0
+          ? `Batch finished with ${batchFailed.value} failed file${batchFailed.value === 1 ? "" : "s"}.`
+          : "Batch complete.";
+      } else {
+        status.value = directoryHandle
+          ? "Waiting for download jobs…"
+          : "Choose a download folder to begin.";
+      }
       return;
     }
     if (!directoryHandle || !(await ensureDirectoryPermission(directoryHandle))) {
       await restoreJob(job);
-      status.value = "Choose or authorize a download folder to continue.";
+      status.value = "Download folder access is required to continue.";
+      emit("folderRequired");
       return;
     }
     await runJob(job);
@@ -176,6 +151,8 @@ async function runJob(job: BrowserDownloadJob): Promise<void> {
     [browserDownloadJobKey(job.mediaId)]: job
   });
   activeJob.value = job;
+  lastFilename.value = job.outputFilename;
+  toastVisible.value = true;
   progress.value = 0;
   running.value = true;
   cancelRequested = false;
@@ -213,6 +190,7 @@ async function runJob(job: BrowserDownloadJob): Promise<void> {
     await updateHistory(job, "completed");
     await chrome.storage.session.remove(browserDownloadJobKey(job.mediaId));
   } catch (error) {
+    batchFailed.value += 1;
     const message = error instanceof Error ? error.message : "Browser download failed.";
     status.value = message;
     await writable?.abort().catch(() => undefined);
@@ -227,6 +205,7 @@ async function runJob(job: BrowserDownloadJob): Promise<void> {
     paused.value = false;
     running.value = false;
     activeJob.value = null;
+    batchProcessed.value += 1;
   }
 }
 
@@ -567,17 +546,41 @@ async function refreshQueueLength(): Promise<void> {
   queueLength.value = queuedMedia(stored).length;
 }
 
+function registerQueueState(): void {
+  if (queueLength.value === 0) return;
+
+  const previousBatchComplete = !running.value
+    && batchTotal.value > 0
+    && batchProcessed.value >= batchTotal.value;
+
+  if (!toastVisible.value || previousBatchComplete) {
+    batchTotal.value = 0;
+    batchProcessed.value = 0;
+    batchFailed.value = 0;
+    progress.value = 0;
+    logs.value = [];
+  }
+
+  toastVisible.value = true;
+  batchTotal.value = Math.max(
+    batchTotal.value,
+    batchProcessed.value + queueLength.value + (running.value ? 1 : 0)
+  );
+}
+
 function handleStorageChange(
   changes: Record<string, chrome.storage.StorageChange>,
   areaName: string
 ): void {
   if (areaName === "local" && changes[BROWSER_DOWNLOAD_REVISION_KEY]) {
-    void refreshQueueLength().then(processQueue);
+    void refreshQueueLength().then(() => {
+      registerQueueState();
+      return processQueue();
+    });
   }
   if (areaName === "local" && changes[SETTINGS_KEY]) {
     void loadDownloadDirectoryHandle().then((handle) => {
       directoryHandle = handle;
-      folderName.value = handle?.name ?? null;
       return processQueue();
     });
   }
@@ -588,17 +591,6 @@ async function ensureDirectoryPermission(handle: FileSystemDirectoryHandle): Pro
   const options = { mode: "readwrite" as const };
   if (await permissionHandle.queryPermission(options) === "granted") return true;
   return false;
-}
-
-async function saveFolderName(name: string): Promise<void> {
-  const stored = await chrome.storage.local.get(SETTINGS_KEY);
-  const settings = stored[SETTINGS_KEY];
-  await chrome.storage.local.set({
-    [SETTINGS_KEY]: {
-      ...(settings && typeof settings === "object" ? settings : {}),
-      downloadDirectory: sanitizeFilenameComponent(name, "Downloads")
-    }
-  });
 }
 
 async function updateHistory(
@@ -692,57 +684,90 @@ function redactResponseBody(value: string): string {
 </script>
 
 <template>
-  <main class="mx-auto grid min-h-screen max-w-4xl content-start gap-6 p-8">
-    <header>
-      <p class="text-xs font-semibold tracking-widest text-violet-300 uppercase">
-        Fansly MyMedia
-      </p>
-      <h1 class="mt-1 text-2xl font-semibold tracking-tight">
-        Browser download manager
-      </h1>
-      <p class="mt-2 text-sm text-zinc-400">
-        Full-quality HLS videos are combined and written directly by Chrome.
-      </p>
+  <aside
+    v-if="toastVisible"
+    aria-label="Download progress"
+    aria-live="polite"
+    class="
+      fixed right-5 bottom-28 z-50 w-[min(28rem,calc(100vw-2.5rem))]
+      overflow-hidden rounded-2xl border border-white/10 bg-zinc-950/95
+      text-zinc-100 shadow-2xl shadow-black/60 backdrop-blur-sm
+    "
+  >
+    <header class="flex items-start gap-3 border-b border-white/10 px-4 py-3">
+      <div class="min-w-0 flex-1">
+        <h2 class="text-sm font-semibold">
+          Downloads
+        </h2>
+        <p class="mt-0.5 text-xs text-zinc-400">
+          {{ batchProcessed }} of {{ batchTotal }} files processed
+          <template v-if="batchFailed">
+            · {{ batchFailed }} failed
+          </template>
+        </p>
+      </div>
+      <button
+        aria-label="Close download progress"
+        class="
+          rounded-md px-2 py-1 text-sm text-zinc-400 transition
+          hover:bg-white/10 hover:text-white
+          disabled:cursor-not-allowed disabled:opacity-40
+        "
+        type="button"
+        :disabled="running || queueLength > 0"
+        title="Downloads must finish before this notification can be closed"
+        @click="toastVisible = false"
+      >
+        ✕
+      </button>
     </header>
 
-    <section class="rounded-2xl border border-white/10 bg-zinc-900 p-5">
-      <div class="flex items-center gap-4">
-        <div class="min-w-0 flex-1">
-          <p class="text-sm font-medium">
-            Download folder
-          </p>
-          <p class="mt-1 truncate text-xs text-zinc-400">
-            {{ folderName ?? "No folder selected" }}
-          </p>
+    <div class="grid gap-4 p-4">
+      <section>
+        <div class="flex justify-between text-xs text-zinc-400">
+          <span>Batch progress</span>
+          <span>{{ batchProgress }}%</span>
         </div>
-        <button
-          class="
-            rounded-lg bg-violet-600 px-4 py-2 text-sm font-medium
-            hover:bg-violet-500
-          "
-          type="button"
-          @click="chooseFolder"
-        >
-          Choose folder
-        </button>
-      </div>
-    </section>
+        <div class="mt-2 h-2 overflow-hidden rounded-full bg-zinc-800">
+          <div
+            class="
+              h-full rounded-full bg-violet-500 transition-all duration-300
+            "
+            :style="{ width: `${batchProgress}%` }"
+          />
+        </div>
+      </section>
 
-    <section class="rounded-2xl border border-white/10 bg-zinc-900 p-5">
-      <div class="flex items-center justify-between gap-4 text-sm">
-        <span>{{ status }}</span>
-        <span class="text-zinc-400">{{ queueLength }} queued</span>
-      </div>
-      <div class="mt-4 h-2 overflow-hidden rounded-full bg-zinc-800">
+      <section>
         <div
-          class="h-full rounded-full bg-violet-500 transition-all"
-          :style="{ width: `${progress}%` }"
-        />
+          class="flex items-center justify-between gap-3 text-xs text-zinc-400"
+        >
+          <span class="min-w-0 truncate">
+            {{ activeJob?.outputFilename ?? lastFilename ?? "Preparing download…" }}
+          </span>
+          <span class="shrink-0">{{ progress }}%</span>
+        </div>
+        <div class="mt-2 h-2 overflow-hidden rounded-full bg-zinc-800">
+          <div
+            class="h-full rounded-full bg-cyan-400 transition-all duration-300"
+            :style="{ width: `${progress}%` }"
+          />
+        </div>
+      </section>
+
+      <div class="flex items-start justify-between gap-4">
+        <p class="min-w-0 text-xs/5 text-zinc-300">
+          {{ status }}
+        </p>
+        <p class="shrink-0 text-xs/5 text-zinc-500">
+          {{ queueLength }} queued
+        </p>
       </div>
-      <div class="mt-4 flex gap-3">
+
+      <div class="flex flex-wrap gap-2">
         <button
           class="
-            rounded-lg bg-zinc-800 px-4 py-2 text-sm
+            rounded-lg bg-zinc-800 px-3 py-2 text-xs transition
             hover:bg-zinc-700
             disabled:opacity-40
           "
@@ -754,7 +779,7 @@ function redactResponseBody(value: string): string {
         </button>
         <button
           class="
-            rounded-lg bg-zinc-800 px-4 py-2 text-sm
+            rounded-lg bg-zinc-800 px-3 py-2 text-xs transition
             hover:bg-zinc-700
             disabled:opacity-40
           "
@@ -766,7 +791,7 @@ function redactResponseBody(value: string): string {
         </button>
         <button
           class="
-            rounded-lg bg-red-950 px-4 py-2 text-sm text-red-200
+            rounded-lg bg-red-950 px-3 py-2 text-xs text-red-200 transition
             hover:bg-red-900
             disabled:opacity-40
           "
@@ -774,35 +799,36 @@ function redactResponseBody(value: string): string {
           :disabled="!running"
           @click="cancelDownload"
         >
-          Cancel
+          Cancel file
         </button>
       </div>
-    </section>
 
-    <section
-      v-if="debugEnabled || logs.length"
-      class="rounded-2xl border border-white/10 bg-black p-5"
-    >
-      <div class="flex items-center justify-between gap-4">
-        <h2 class="text-sm font-medium">
+      <details
+        v-if="debugEnabled || logs.length"
+        class="border-t border-white/10 pt-3"
+      >
+        <summary class="cursor-pointer text-xs font-medium text-zinc-300">
           Detailed diagnostics
-        </h2>
-        <button
+        </summary>
+        <div class="mt-3 flex justify-end">
+          <button
+            class="
+              rounded-lg bg-zinc-800 px-3 py-1.5 text-xs
+              hover:bg-zinc-700
+            "
+            type="button"
+            @click="copyLogs"
+          >
+            Copy logs
+          </button>
+        </div>
+        <pre
           class="
-            rounded-lg bg-zinc-800 px-3 py-1.5 text-xs
-            hover:bg-zinc-700
+            mt-2 max-h-48 overflow-auto rounded-lg bg-black p-3 text-xs
+            whitespace-pre-wrap text-zinc-400
           "
-          type="button"
-          @click="copyLogs"
-        >
-          Copy logs
-        </button>
-      </div>
-      <pre
-        class="
-          mt-3 max-h-96 overflow-auto text-xs whitespace-pre-wrap text-zinc-400
-        "
-      >{{ logs.join("\n") }}</pre>
-    </section>
-  </main>
+        >{{ logs.join("\n") }}</pre>
+      </details>
+    </div>
+  </aside>
 </template>

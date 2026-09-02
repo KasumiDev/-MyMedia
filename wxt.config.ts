@@ -8,6 +8,9 @@ export default defineConfig({
     name: "Fansly MyMedia",
     version: "0.1.0",
     description: "Collects and downloads media from the signed-in user's MyMedia library.",
+    action: {
+      default_title: "Open Fansly MyMedia"
+    },
     permissions: ["storage"],
     host_permissions: [
       "https://fansly.com/*",

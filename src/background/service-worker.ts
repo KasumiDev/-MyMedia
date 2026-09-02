@@ -4,7 +4,6 @@ import {
   sanitizeOriginalFilename
 } from "../core/filenames";
 import {
-  BROWSER_DOWNLOAD_PROCESSOR_KEY,
   BROWSER_DOWNLOAD_REVISION_KEY,
   browserDownloadJobKey,
   browserDownloadQueueKey,
@@ -40,6 +39,10 @@ export function installServiceWorker(): void {
     .then(publishDownloadIndex)
     .catch(() => undefined);
 
+  chrome.action.onClicked.addListener(() => {
+    void openLibraryPage();
+  });
+
   chrome.runtime.onMessage.addListener((message: unknown, sender, sendResponse) => {
     if (!message || typeof message !== "object") return;
     const request = message as {
@@ -60,7 +63,7 @@ export function installServiceWorker(): void {
     };
 
     if (request.type === "fansly-mymedia:get-download-index") {
-      if (sender.url?.startsWith("https://fansly.com/") !== true) {
+      if (!isLibrarySender(sender)) {
         sendResponse({ ok: false, index: {} });
         return;
       }
@@ -72,7 +75,7 @@ export function installServiceWorker(): void {
 
     if (request.type === "fansly-mymedia:get-thumbnail") {
       const mediaId = validMediaId(request.mediaId);
-      if (!mediaId || sender.url?.startsWith("https://fansly.com/") !== true) {
+      if (!mediaId || !isLibrarySender(sender)) {
         sendResponse({ ok: false, dataUrl: null });
         return;
       }
@@ -82,20 +85,9 @@ export function installServiceWorker(): void {
       return true;
     }
 
-    if (request.type === "fansly-mymedia:open-download-manager") {
-      if (sender.url?.startsWith("https://fansly.com/") !== true) {
-        sendResponse({ ok: false });
-        return;
-      }
-      void openDownloadManager(true)
-        .then(() => sendResponse({ ok: true }))
-        .catch(() => sendResponse({ ok: false }));
-      return true;
-    }
-
     if (request.type === "fansly-mymedia:download") {
       const url = validMediaUrl(request.url);
-      if (!url || sender.url?.startsWith("https://fansly.com/") !== true) {
+      if (!url || !isLibrarySender(sender)) {
         sendResponse({
           ok: false,
           error: "Only an approved Fansly media URL can be downloaded."
@@ -183,7 +175,6 @@ async function queueBrowserDownload(
   await chrome.storage.local.set({
     [BROWSER_DOWNLOAD_REVISION_KEY]: `${Date.now()}-${crypto.randomUUID()}`
   });
-  await openDownloadManager(false);
   return { mode: "browser-native" };
 }
 
@@ -227,21 +218,28 @@ function validGroupId(value: unknown): string | null {
   return typeof value === "string" && /^\d{6,30}$/u.test(value) ? value : null;
 }
 
-async function openDownloadManager(settingsOnly: boolean): Promise<void> {
-  const baseUrl = chrome.runtime.getURL("download.html");
-  if (settingsOnly) {
-    await chrome.tabs.create({ url: `${baseUrl}?settings=1`, active: true });
+async function openLibraryPage(): Promise<void> {
+  const url = chrome.runtime.getURL("library.html");
+  const contexts = await new Promise<chrome.runtime.ExtensionContext[]>((resolve) => {
+    chrome.runtime.getContexts({
+      contextTypes: [chrome.runtime.ContextType.TAB],
+      documentUrls: [url]
+    }, resolve);
+  });
+  const existing = contexts.find((context) => context.tabId >= 0);
+  if (existing) {
+    await chrome.tabs.update(existing.tabId, { active: true });
+    if (existing.windowId >= 0) {
+      await chrome.windows.update(existing.windowId, { focused: true });
+    }
     return;
   }
+  await chrome.tabs.create({ url, active: true });
+}
 
-  const stored = await chrome.storage.session.get(BROWSER_DOWNLOAD_PROCESSOR_KEY);
-  const heartbeat = stored[BROWSER_DOWNLOAD_PROCESSOR_KEY];
-  if (typeof heartbeat === "number" && Date.now() - heartbeat < 12_000) return;
-
-  await chrome.storage.session.set({
-    [BROWSER_DOWNLOAD_PROCESSOR_KEY]: Date.now()
-  });
-  await chrome.tabs.create({ url: baseUrl, active: true });
+function isLibrarySender(sender: chrome.runtime.MessageSender): boolean {
+  return sender.id === chrome.runtime.id
+    && sender.url?.startsWith(chrome.runtime.getURL("library.html")) === true;
 }
 
 function validDownloadMetadata(value: {

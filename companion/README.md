@@ -1,7 +1,7 @@
 # Fansly MyMedia companion (experimental fallback)
 
 The active Chrome extension does not require or invoke this host. Its
-browser-native download manager handles full-quality HLS downloads directly.
+browser-native library processor handles full-quality HLS downloads directly.
 This package remains available for experiments and troubleshooting only.
 
 Windows 11 native-messaging host for full-quality HLS and DASH downloads. The

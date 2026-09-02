@@ -5,7 +5,8 @@ import {
   buildDownloadFilename,
   DEFAULT_DOWNLOAD_DIRECTORY,
   normalizeDownloadDirectory,
-  formatMediaCreatedAt
+  formatMediaCreatedAt,
+  sanitizeFilenameComponent
 } from "../core/filenames";
 import { mergeUniqueMedia } from "../core/media-library";
 import {
@@ -14,12 +15,18 @@ import {
   type MediaSortOrder
 } from "../core/media-sort";
 import { paginateGroups, paginateMedia } from "../core/pagination";
+import { BRIDGE_RELAY_REQUEST } from "../core/relay-protocol";
+import {
+  loadDownloadDirectoryHandle,
+  saveDownloadDirectoryHandle
+} from "../storage/download-directory";
 import type {
   DownloadIndex,
   DownloadRecord,
   DownloadState
 } from "../storage/download-index";
 import DownloadThumbnail from "./DownloadThumbnail.vue";
+import DownloadProgressToast from "./DownloadProgressToast.vue";
 import VideoStripePreview from "./VideoStripePreview.vue";
 
 const DOWNLOAD_REVISION_KEY = "fansly-mymedia:download-revision";
@@ -65,7 +72,6 @@ type BridgeResult = {
   error?: string;
 };
 
-const isOpen = ref(false);
 const isSettingsOpen = ref(false);
 const isCollecting = ref(false);
 const isCollectionPaused = ref(false);
@@ -75,19 +81,31 @@ const groups = ref<Group[]>([]);
 const library = ref<MediaItem[]>([]);
 const selectedIds = ref(new Set<string>());
 const downloadIndex = ref<DownloadIndex>({});
-const status = ref("Open MyMedia to begin collecting your library.");
+const status = ref("Preparing the media library…");
 const currentChat = ref(0);
 const chatLimit = ref(DEFAULT_CHAT_LIMIT);
 const minDelay = ref(1);
 const maxDelay = ref(5);
 const companionDebug = ref(false);
 const downloadDirectory = ref(DEFAULT_DOWNLOAD_DIRECTORY);
+const downloadFolderName = ref<string | null>(null);
+const folderDialogOpen = ref(false);
+const folderDialogMessage = ref("");
 const sortOrder = ref<MediaSortOrder>("created-desc");
 const hoveredMediaId = ref<string | null>(null);
 const focusedMediaId = ref<string | null>(null);
 
 let collectionController: AbortController | null = null;
 let pauseDownloadBatch = false;
+let directoryHandle: FileSystemDirectoryHandle | null = null;
+let folderDialogPromise: Promise<boolean> | null = null;
+let folderDialogResolver: ((selected: boolean) => void) | null = null;
+
+type PermissionState = "granted" | "denied" | "prompt";
+type PermissionHandle = FileSystemDirectoryHandle & {
+  queryPermission(options?: { mode?: "read" | "readwrite" }): Promise<PermissionState>;
+  values(): AsyncIterableIterator<unknown>;
+};
 
 const imageCount = computed(() => countMedia("image"));
 const videoCount = computed(() => countMedia("video"));
@@ -119,21 +137,22 @@ const selectedMedia = computed(() => library.value.filter((item) =>
 
 onMounted(async () => {
   chrome.storage.onChanged.addListener(handleStorageChange);
-  await Promise.all([
+  const [, , handle] = await Promise.all([
     refreshDownloadIndex(),
-    loadSettings()
+    loadSettings(),
+    loadDownloadDirectoryHandle()
   ]);
+  directoryHandle = handle;
+  downloadFolderName.value = handle?.name ?? null;
+  if (handle) downloadDirectory.value = normalizeDownloadDirectory(handle.name);
+  await collectLibrary();
 });
 
 onBeforeUnmount(() => {
   collectionController?.abort();
+  settleFolderDialog(false);
   chrome.storage.onChanged.removeListener(handleStorageChange);
 });
-
-async function openLibrary(): Promise<void> {
-  isOpen.value = true;
-  if (!isCollecting.value && library.value.length === 0) await collectLibrary();
-}
 
 async function collectLibrary(): Promise<void> {
   collectionController?.abort();
@@ -267,6 +286,7 @@ function clearSelection(): void {
 }
 
 async function downloadSelected(): Promise<void> {
+  if (!(await ensureDownloadFolder())) return;
   isDownloading.value = true;
   pauseDownloadBatch = false;
 
@@ -284,6 +304,7 @@ async function downloadSelected(): Promise<void> {
 async function retryFailed(mediaId: string): Promise<void> {
   const record = downloadIndex.value[mediaId];
   if (!record) return;
+  if (!(await ensureDownloadFolder())) return;
   isDownloading.value = true;
   status.value = `Refreshing media ${mediaId} before retry…`;
   try {
@@ -303,6 +324,7 @@ async function retryFailed(mediaId: string): Promise<void> {
 }
 
 async function retryAllFailed(): Promise<void> {
+  if (!(await ensureDownloadFolder())) return;
   isDownloading.value = true;
   status.value = `Retrying ${failedCount.value} failed downloads…`;
   const records = [...failedRecords.value];
@@ -440,12 +462,6 @@ async function loadRetryGroups(): Promise<Group[]> {
   });
 }
 
-async function openDownloadManager(): Promise<void> {
-  await chrome.runtime.sendMessage({
-    type: "fansly-mymedia:open-download-manager"
-  });
-}
-
 function pauseDownloads(): void {
   pauseDownloadBatch = true;
 }
@@ -458,7 +474,13 @@ function handleStorageChange(
     void refreshDownloadIndex();
   }
   if (areaName === "local" && changes[SETTINGS_KEY]) {
-    void loadSettings();
+    void Promise.all([
+      loadSettings(),
+      loadDownloadDirectoryHandle().then((handle) => {
+        directoryHandle = handle;
+        downloadFolderName.value = handle?.name ?? null;
+      })
+    ]);
   }
 }
 
@@ -554,44 +576,120 @@ async function command(
   operation: "groups" | "media",
   extra: Record<string, unknown>
 ): Promise<BridgeResult> {
-  const requestId = crypto.randomUUID();
-  return new Promise((resolve) => {
-    const timeout = window.setTimeout(
-      () => finish({ ok: false, error: "Request timed out." }),
-      30_000
+  const tabs = await chrome.tabs.query({ url: "https://fansly.com/*" });
+  const tab = tabs
+    .filter((candidate) => candidate.id !== undefined)
+    .sort((left, right) => (right.lastAccessed ?? 0) - (left.lastAccessed ?? 0))[0];
+  if (tab?.id === undefined) {
+    return {
+      ok: false,
+      error: "Open and sign in to Fansly in another tab, then try again."
+    };
+  }
+  try {
+    return await chrome.tabs.sendMessage(tab.id, {
+      type: BRIDGE_RELAY_REQUEST,
+      operation,
+      ...extra
+    }) as BridgeResult;
+  } catch {
+    return {
+      ok: false,
+      error: "Refresh the open Fansly tab so the extension can connect to it."
+    };
+  }
+}
+
+async function ensureDownloadFolder(): Promise<boolean> {
+  if (!directoryHandle) {
+    return requestDownloadFolder(
+      "Select a folder before starting the download."
     );
+  }
+  if (await isDirectoryAvailable(directoryHandle)) return true;
+  status.value = "Choose an available download folder before downloading.";
+  return requestDownloadFolder(
+    "The previous download folder is unavailable. Select it again or choose another folder."
+  );
+}
 
-    function listener(event: Event): void {
-      const value = (event as CustomEvent<{
-        requestId?: string;
-        ok?: boolean;
-        payload?: unknown;
-        error?: string;
-      }>).detail;
-      if (value?.requestId === requestId) {
-        finish({
-          ok: value.ok === true,
-          payload: value.payload,
-          error: value.error
-        });
-      }
+async function chooseDownloadFolder(): Promise<boolean> {
+  const picker = window as unknown as Window & {
+    showDirectoryPicker(options?: {
+      id?: string;
+      mode?: "read" | "readwrite";
+      startIn?: "downloads";
+    }): Promise<FileSystemDirectoryHandle>;
+  };
+  try {
+    const handle = await picker.showDirectoryPicker({
+      id: "fansly-mymedia-downloads",
+      mode: "readwrite",
+      startIn: "downloads"
+    });
+    await saveDownloadDirectoryHandle(handle);
+    directoryHandle = handle;
+    downloadFolderName.value = handle.name;
+    downloadDirectory.value = sanitizeFilenameComponent(handle.name, "Downloads");
+    await saveDownloadFolderName(downloadDirectory.value);
+    status.value = `Downloads will be saved directly in ${handle.name}.`;
+    return true;
+  } catch (error) {
+    if (!(error instanceof DOMException && error.name === "AbortError")) {
+      status.value = errorMessage(error, "Chrome could not open that folder.");
     }
+    return false;
+  }
+}
 
-    function finish(result: BridgeResult): void {
-      window.clearTimeout(timeout);
-      window.removeEventListener("fansly-mymedia:result", listener);
-      resolve(result);
+function requestDownloadFolder(message: string): Promise<boolean> {
+  if (folderDialogPromise) return folderDialogPromise;
+  folderDialogMessage.value = message;
+  folderDialogOpen.value = true;
+  folderDialogPromise = new Promise<boolean>((resolve) => {
+    folderDialogResolver = resolve;
+  });
+  return folderDialogPromise;
+}
+
+async function confirmDownloadFolder(): Promise<void> {
+  if (await chooseDownloadFolder()) settleFolderDialog(true);
+}
+
+function settleFolderDialog(selected: boolean): void {
+  folderDialogOpen.value = false;
+  folderDialogResolver?.(selected);
+  folderDialogResolver = null;
+  folderDialogPromise = null;
+}
+
+function handleDownloadFolderRequired(): void {
+  void requestDownloadFolder(
+    "The download folder can no longer be accessed. Select it again to continue the queued downloads."
+  );
+}
+
+async function isDirectoryAvailable(handle: FileSystemDirectoryHandle): Promise<boolean> {
+  try {
+    const permissionHandle = handle as PermissionHandle;
+    if (await permissionHandle.queryPermission({ mode: "readwrite" }) !== "granted") {
+      return false;
     }
+    await permissionHandle.values().next();
+    return true;
+  } catch {
+    return false;
+  }
+}
 
-    window.addEventListener("fansly-mymedia:result", listener);
-    window.dispatchEvent(new CustomEvent("fansly-mymedia:command", {
-      detail: {
-        type: "fansly-mymedia:command",
-        requestId,
-        operation,
-        ...extra
-      }
-    }));
+async function saveDownloadFolderName(name: string): Promise<void> {
+  const stored = await chrome.storage.local.get(SETTINGS_KEY);
+  const settings = stored[SETTINGS_KEY];
+  await chrome.storage.local.set({
+    [SETTINGS_KEY]: {
+      ...(settings && typeof settings === "object" ? settings : {}),
+      downloadDirectory: name
+    }
   });
 }
 
@@ -601,28 +699,12 @@ function errorMessage(error: unknown, fallback: string): string {
 </script>
 
 <template>
-  <button
-    v-if="!isOpen"
-    class="
-      fixed bottom-5 left-5 z-2147483647 rounded-full bg-violet-600 px-5 py-3
-      font-sans text-sm font-semibold text-white shadow-xl transition
-      hover:bg-violet-500
-      focus:ring-2 focus:ring-violet-300 focus:outline-none
-    "
-    type="button"
-    @click="openLibrary"
-  >
-    MyMedia
-  </button>
-
   <section
-    v-else
     class="
-      fixed inset-[3vh_3vw] z-2147483647 flex flex-col overflow-hidden
-      rounded-2xl border border-white/10 bg-zinc-950 font-sans text-zinc-100
-      antialiased shadow-2xl
+      flex h-screen flex-col overflow-hidden bg-zinc-950 font-sans text-zinc-100
+      antialiased
     "
-    role="dialog"
+    role="main"
     aria-label="Fansly MyMedia library"
   >
     <header class="flex items-center gap-3 border-b border-white/10 px-6 py-4">
@@ -636,31 +718,37 @@ function errorMessage(error: unknown, fallback: string): string {
       </div>
       <button
         class="
-          rounded-lg bg-zinc-800 px-3 py-2 text-sm transition
+          max-w-64 rounded-lg bg-zinc-800 px-3 py-2 text-left text-sm transition
+          hover:bg-zinc-700
+        "
+        type="button"
+        @click="chooseDownloadFolder"
+      >
+        <span class="block text-[0.65rem] text-zinc-500 uppercase">
+          Download folder
+        </span>
+        <span class="block truncate">
+          {{ downloadFolderName ?? "Select folder" }}
+        </span>
+      </button>
+      <button
+        class="
+          flex items-center gap-2 rounded-lg bg-zinc-800 px-3 py-2 text-sm
+          transition
           hover:bg-zinc-700
         "
         type="button"
         aria-label="Settings"
         @click="isSettingsOpen = !isSettingsOpen"
       >
-        ⚙
-      </button>
-      <button
-        class="
-          rounded-lg bg-zinc-800 px-3 py-2 text-sm transition
-          hover:bg-zinc-700
-        "
-        type="button"
-        aria-label="Close"
-        @click="isOpen = false"
-      >
-        ×
+        <span aria-hidden="true">⚙</span>
+        <span>Settings</span>
       </button>
     </header>
 
     <div
       v-if="isSettingsOpen"
-      class="grid max-w-xl gap-5 p-6"
+      class="grid max-w-xl gap-5 overflow-auto p-6"
     >
       <div>
         <h2 class="text-lg font-semibold">
@@ -701,29 +789,6 @@ function errorMessage(error: unknown, fallback: string): string {
           min="1"
         >
       </label>
-      <label class="grid gap-2 text-sm">
-        Download folder
-        <input
-          v-model="downloadDirectory"
-          class="rounded-lg border border-white/10 bg-zinc-900 px-3 py-2"
-          type="text"
-          readonly
-        >
-        <span class="text-xs text-zinc-500">
-          Chrome writes media directly to the selected folder without buffering
-          the complete file in memory.
-        </span>
-      </label>
-      <button
-        class="
-          justify-self-start rounded-lg bg-zinc-800 px-4 py-2 text-sm transition
-          hover:bg-zinc-700
-        "
-        type="button"
-        @click="openDownloadManager"
-      >
-        Choose download folder
-      </button>
       <label
         class="
           flex items-start gap-3 rounded-xl border border-white/10 bg-zinc-900
@@ -741,7 +806,7 @@ function errorMessage(error: unknown, fallback: string): string {
           </span>
           <span class="mt-1 block text-xs/5 text-zinc-400">
             Captures HLS requests, response metadata, conversion details, and
-            sanitized manifests in the download-manager tab.
+            sanitized manifests in the download progress notification.
           </span>
         </span>
       </label>
@@ -1100,4 +1165,52 @@ function errorMessage(error: unknown, fallback: string): string {
 
     <output class="border-t border-white/10 px-6 py-2 text-xs text-zinc-500">{{ status }}</output>
   </section>
+  <div
+    v-if="folderDialogOpen"
+    class="fixed inset-0 z-60 grid place-items-center bg-black/70 p-6"
+    role="dialog"
+    aria-modal="true"
+    aria-labelledby="folder-dialog-title"
+  >
+    <div
+      class="
+        w-full max-w-md rounded-2xl border border-white/10 bg-zinc-950 p-6
+        shadow-2xl
+      "
+    >
+      <h2
+        id="folder-dialog-title"
+        class="text-lg font-semibold text-zinc-100"
+      >
+        Select download folder
+      </h2>
+      <p class="mt-2 text-sm/6 text-zinc-400">
+        {{ folderDialogMessage }}
+      </p>
+      <div class="mt-6 flex justify-end gap-3">
+        <button
+          class="
+            rounded-lg bg-zinc-800 px-4 py-2 text-sm text-zinc-200 transition
+            hover:bg-zinc-700
+          "
+          type="button"
+          @click="settleFolderDialog(false)"
+        >
+          Cancel
+        </button>
+        <button
+          class="
+            rounded-lg bg-violet-600 px-4 py-2 text-sm font-medium text-white
+            transition
+            hover:bg-violet-500
+          "
+          type="button"
+          @click="confirmDownloadFolder"
+        >
+          Select folder
+        </button>
+      </div>
+    </div>
+  </div>
+  <DownloadProgressToast @folder-required="handleDownloadFolderRequired" />
 </template>

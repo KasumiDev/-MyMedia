@@ -1,7 +1,7 @@
 # Windows native companion (experimental fallback)
 
 > The Chrome extension no longer invokes this companion. Full-quality HLS
-> downloads now run in the extension download-manager page and write directly
+> downloads now run in the extension library page and write directly
 > to a user-selected directory. This document is retained for debugging and
 > possible fallback use only.
 
