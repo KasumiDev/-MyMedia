@@ -34,7 +34,10 @@ const EXTENSIONS_BY_MIME: Record<string, readonly string[]> = {
  */
 export function sanitizeFilenameComponent(value: string, fallback = "unknown"): string {
   const normalized = value.normalize("NFKC")
-    .replace(/[<>:"/\\|?*\u0000-\u001F]/g, "-")
+    .replace(/[<>:"/\\|?*]/g, "-")
+    .split("")
+    .map((character) => character.charCodeAt(0) < 32 ? "-" : character)
+    .join("")
     .replace(/\s+/g, "-")
     .replace(/-+/g, "-")
     .replace(/^[.\- ]+|[.\- ]+$/g, "")

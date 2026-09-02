@@ -10,6 +10,7 @@ export interface MediaOffer {
 export interface MediaPage {
   offers: MediaOffer[];
   accountMediaCount: number;
+  downloadableMedia?: unknown[];
 }
 
 export interface DiagnosticEvent {

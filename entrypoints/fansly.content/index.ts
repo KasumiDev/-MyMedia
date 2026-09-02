@@ -1,6 +1,6 @@
 import { createApp } from "vue";
 import App from "../../src/ui/App.vue";
-import "./style.css";
+import "../../src/ui/tailwind.css";
 
 export default defineContentScript({
   matches: ["https://fansly.com/*"],

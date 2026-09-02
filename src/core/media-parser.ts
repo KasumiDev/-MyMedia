@@ -11,6 +11,7 @@ export interface DownloadableMedia {
   width: number;
   height: number;
   extension: string;
+  previewUrl: string | null;
 }
 
 export interface ManifestMedia {
@@ -67,10 +68,20 @@ function selectAccountMedia(value: unknown): DownloadableMedia[] {
     const url = signedLocation(firstArrayValue(rendition, "locations"));
     const mediaId = idFrom(rendition, "id") ?? idFrom(media, "id");
     if (!kind || !extension || !url || !mediaId) continue;
-    candidates.push({ accountMediaId, mediaId, kind, mimetype, extension, url, width: numberFrom(rendition, "width"), height: numberFrom(rendition, "height") });
+    const previewUrl = selectPreview(media, kind);
+    candidates.push({ accountMediaId, mediaId, kind, mimetype, extension, url, previewUrl, width: numberFrom(rendition, "width"), height: numberFrom(rendition, "height") });
   }
   candidates.sort(compareQuality);
   return candidates.slice(0, 1);
+}
+
+function selectPreview(media: UnknownRecord, kind: DirectMediaKind): string | null {
+  const previews = renditions(media).filter((item) => {
+    const mime = stringFrom(item, "mimetype") ?? "";
+    return mime.startsWith("image/") && (kind === "video" || numberFrom(item, "height") <= 480);
+  });
+  previews.sort((a, b) => numberFrom(b, "height") - numberFrom(a, "height"));
+  return previews.map((item) => signedLocation(firstArrayValue(item, "locations"))).find((url): url is string => url !== null) ?? null;
 }
 
 function renditions(media: UnknownRecord): UnknownRecord[] {

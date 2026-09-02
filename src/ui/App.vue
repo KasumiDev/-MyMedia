@@ -1,82 +1,563 @@
 <script setup lang="ts">
-import { computed, ref } from "vue";
-import { paginateGroups, paginateMedia, RepeatedCursorError } from "../core/pagination";
+import { computed, onBeforeUnmount, onMounted, ref } from "vue";
+import { TabsContent, TabsList, TabsRoot, TabsTrigger } from "reka-ui";
+import { paginateGroups, paginateMedia } from "../core/pagination";
+import type { DownloadIndex, DownloadState } from "../storage/download-index";
+import { loadDownloadIndex } from "../storage/download-index";
 
-const BRIDGE_COMMAND = "fansly-mymedia:command";
-const BRIDGE_RESULT = "fansly-mymedia:result";
-type Operation = "account" | "groups" | "media";
-type Group = { groupId: string; partnerUsername: string };
-type DirectVideo = { url: string; filename: string; width: number; height: number };
-type Manifest = { url: string; filename: string; width: number; height: number };
-type Result = { type: typeof BRIDGE_RESULT; requestId: string; operation: Operation; ok: boolean; payload?: unknown; error?: string };
-type JobState = "ready" | "running" | "paused" | "stopped";
+const DOWNLOAD_INDEX_KEY = "fansly-mymedia:download-index";
 
-const status = ref("Ready. Start discovers chats; then select a chat to inspect media.");
-const groups = ref<Group[]>([]); const chatId = ref(""); const selectedGroup = ref("");
-const directVideo = ref<DirectVideo | null>(null); const dashManifest = ref<Manifest | null>(null); const hlsManifest = ref<Manifest | null>(null);
-const jobState = ref<JobState>("ready"); const currentPartner = ref("—"); const currentCursor = ref("—"); const retry = ref("None");
-const discoveredMedia = ref(0); const completed = ref(0); const skipped = ref(0); const failed = ref(0); const debugEnabled = ref(false);
-// TODO: remove/change this initial safety limit once pagination and rate-limit behavior are verified end-to-end.
-const chatLimit = ref(5); const minDelay = ref(1); const maxDelay = ref(5);
-let activeJob: AbortController | null = null; let resumeJob: (() => Promise<void>) | null = null;
-const running = computed(() => jobState.value === "running"); const paused = computed(() => jobState.value === "paused");
-const shownGroups = computed(() => groups.value.slice(0, chatLimit.value > 0 ? chatLimit.value : groups.value.length));
-const validGroupId = (value: string) => /^\d{6,30}$/.test(value);
+type Group = {
+  groupId: string;
+  partnerUsername: string;
+};
 
-window.addEventListener("fansly-mymedia:retry", (event: Event) => {
-  const value = (event as CustomEvent<{ reason?: string; attempt?: number; retryAt?: number }>).detail;
-  if (!value?.reason || typeof value.retryAt !== "number") return;
-  retry.value = `${value.reason}, attempt ${value.attempt ?? 0}; ${new Date(value.retryAt).toLocaleTimeString()}`;
-  status.value = `Retrying: ${retry.value}`;
+type MediaKind = "image" | "video";
+type LibraryTab = MediaKind | "downloaded";
+
+type DiscoveredMedia = {
+  accountMediaId: string;
+  mediaId: string;
+  kind: MediaKind;
+  url: string;
+  previewUrl: string | null;
+  width: number;
+  height: number;
+  extension: string;
+};
+
+type MediaItem = DiscoveredMedia & {
+  state: DownloadState | "ready";
+};
+
+type BridgeResult = {
+  ok: boolean;
+  payload?: unknown;
+  error?: string;
+};
+
+const isOpen = ref(false);
+const isSettingsOpen = ref(false);
+const isCollecting = ref(false);
+const isCollectionPaused = ref(false);
+const isDownloading = ref(false);
+const activeTab = ref<LibraryTab>("image");
+const groups = ref<Group[]>([]);
+const library = ref<MediaItem[]>([]);
+const selectedIds = ref(new Set<string>());
+const downloadIndex = ref<DownloadIndex>({});
+const status = ref("Open MyMedia to begin collecting your library.");
+const currentChat = ref(0);
+const minDelay = ref(1);
+const maxDelay = ref(5);
+
+let collectionController: AbortController | null = null;
+let pauseDownloadBatch = false;
+
+const imageCount = computed(() => countMedia("image"));
+const videoCount = computed(() => countMedia("video"));
+const downloadedCount = computed(() => library.value.filter(isCompleted).length);
+const collectionProgress = computed(() => groups.value.length === 0
+  ? 0
+  : Math.round((currentChat.value / groups.value.length) * 100));
+
+const visibleMedia = computed(() => {
+  if (activeTab.value === "downloaded") return library.value.filter(isCompleted);
+  return library.value.filter((item) => item.kind === activeTab.value && !isCompleted(item));
 });
 
-async function start(): Promise<void> { jobState.value = "running"; await account(); if (running.value) await loadAllGroups(); }
-function pause(): void { if (!activeJob) { status.value = "No active pagination job to pause."; return; } resumeJob = chatId.value.trim() ? allMedia : loadAllGroups; activeJob.abort(); jobState.value = "paused"; status.value = "Paused between requests. Resume restarts the current operation."; }
-async function resume(): Promise<void> { if (!resumeJob) { status.value = "Nothing is paused."; return; } jobState.value = "running"; await resumeJob(); }
-function stop(): void { activeJob?.abort(); resumeJob = null; jobState.value = "stopped"; status.value = "Stopped. No more requests will be made until Start."; }
-function saveSettings(): void { minDelay.value = Math.max(0, Math.floor(minDelay.value)); maxDelay.value = Math.max(minDelay.value, Math.floor(maxDelay.value)); status.value = `Delay preference set to ${minDelay.value}–${maxDelay.value}s. Queue persistence will connect this setting in Phase 6.`; }
+const selectedMedia = computed(() => library.value.filter((item) =>
+  selectedIds.value.has(item.accountMediaId) && item.state === "ready"));
 
-async function account(): Promise<void> { const result = await command("account"); if (result.ok) status.value = `Authenticated account ID: ${(result.payload as { accountId: string }).accountId}`; }
-async function loadGroups(): Promise<void> { const result = await command("groups"); if (!result.ok) return; groups.value = (result.payload as { groups: Group[] }).groups; status.value = `Loaded one groups page: ${groups.value.length} chats.`; }
-async function loadAllGroups(): Promise<void> {
-  activeJob?.abort(); const controller = new AbortController(); activeJob = controller; jobState.value = "running"; status.value = "Loading chat groups sequentially…";
-  try { groups.value = await paginateGroups(async (offset) => { const r = await command("groups", undefined, offset); if (!r.ok) throw new Error(r.error ?? "Groups request failed."); return { groups: (r.payload as { groups: Group[] }).groups }; }, { pageSize: 30, signal: controller.signal, onPage: (p, o) => status.value = `Loaded ${p.groups.length} groups at offset ${o}.` }); status.value = `Finished discovering ${groups.value.length} chats. Initial limit: ${chatLimit.value || "unlimited"}.`; }
-  catch (error) { status.value = controller.signal.aborted ? "Groups pagination paused or stopped." : error instanceof Error ? error.message : "Groups pagination failed."; }
-  finally { if (activeJob === controller) { activeJob = null; if (running.value) jobState.value = "ready"; } }
+onMounted(async () => {
+  downloadIndex.value = await loadDownloadIndex();
+  chrome.storage.onChanged.addListener(handleStorageChange);
+});
+
+onBeforeUnmount(() => {
+  collectionController?.abort();
+  chrome.storage.onChanged.removeListener(handleStorageChange);
+});
+
+async function openLibrary(): Promise<void> {
+  isOpen.value = true;
+  if (!isCollecting.value && library.value.length === 0) await collectLibrary();
 }
-function chooseGroup(): void { if (!selectedGroup.value) return; chatId.value = selectedGroup.value; currentPartner.value = groups.value.find((g) => g.groupId === chatId.value)?.partnerUsername || "Unknown"; }
-async function media(): Promise<void> {
-  if (!validGroupId(chatId.value.trim())) { status.value = "Enter a valid numeric chat ID first."; return; } currentCursor.value = "start";
-  const result = await command("media", chatId.value.trim()); if (!result.ok) return;
-  const data = result.payload as { offerCount: number; accountMediaCount: number; directVideo: DirectVideo | null; dashManifest: Manifest | null; hlsManifest: Manifest | null };
-  directVideo.value = data.directVideo; dashManifest.value = data.dashManifest; hlsManifest.value = data.hlsManifest; discoveredMedia.value += data.accountMediaCount; status.value = `First MyMedia page: ${data.offerCount} offers, ${data.accountMediaCount} media records.`;
+
+async function collectLibrary(): Promise<void> {
+  collectionController?.abort();
+  collectionController = new AbortController();
+  isCollecting.value = true;
+  isCollectionPaused.value = false;
+  currentChat.value = 0;
+  status.value = "Discovering chats…";
+
+  try {
+    groups.value = await paginateGroups(fetchGroups, {
+      pageSize: 30,
+      signal: collectionController.signal
+    });
+    await chrome.storage.local.set({ "fansly-mymedia:chats": groups.value });
+
+    for (const [index, group] of groups.value.entries()) {
+      if (collectionController.signal.aborted) break;
+      currentChat.value = index + 1;
+      status.value = `Collecting ${group.partnerUsername || group.groupId}…`;
+      await paginateMedia(
+        (before) => fetchMedia(group.groupId, before),
+        {
+          signal: collectionController.signal,
+          onPage: (page) => addMedia(page.downloadableMedia as DiscoveredMedia[] | undefined)
+        }
+      );
+    }
+
+    status.value = collectionController.signal.aborted
+      ? "Collection paused."
+      : `Collection complete: ${library.value.length} media found.`;
+  } catch (error) {
+    status.value = collectionController.signal.aborted
+      ? "Collection paused."
+      : errorMessage(error, "Collection failed.");
+  } finally {
+    isCollecting.value = false;
+  }
 }
-async function allMedia(): Promise<void> {
-  if (!validGroupId(chatId.value.trim())) { status.value = "Enter a valid numeric chat ID first."; return; } activeJob?.abort(); const controller = new AbortController(); activeJob = controller; jobState.value = "running";
-  try { const pages = await paginateMedia(async (before) => { currentCursor.value = before || "start"; const r = await command("media", chatId.value.trim(), undefined, before); if (!r.ok) throw new Error(r.error ?? "MyMedia request failed."); const p = r.payload as { offers: { id: string }[]; accountMediaCount: number }; return { offers: p.offers, accountMediaCount: p.accountMediaCount }; }, { signal: controller.signal, onPage: (p, before) => { discoveredMedia.value += p.accountMediaCount; status.value = `Fetched ${p.offers.length} offers (cursor ${before || "start"}).`; } }); status.value = `Finished MyMedia pagination: ${pages.length} pages.`; }
-  catch (error) { status.value = controller.signal.aborted ? "MyMedia pagination paused or stopped." : error instanceof RepeatedCursorError ? error.message : error instanceof Error ? error.message : "MyMedia pagination failed."; }
-  finally { if (activeJob === controller) { activeJob = null; if (running.value) jobState.value = "ready"; } }
+
+function pauseCollection(): void {
+  collectionController?.abort();
+  isCollectionPaused.value = true;
 }
-async function download(url: string, filename?: string, success = "Download started. Check Chrome’s downloads page."): Promise<void> { const result = await chrome.runtime.sendMessage({ type: "fansly-mymedia:download", url, filename }) as { ok: boolean; error?: string }; if (result.ok) completed.value++; else failed.value++; status.value = result.ok ? success : result.error ?? "Download failed."; }
-function retryFailed(): void { status.value = failed.value ? "Retrying failed downloads requires persisted download records, coming with Phase 6 recovery." : "No failed downloads in this panel session."; }
-async function command(operation: Operation, groupId?: string, offset?: number, before?: string): Promise<Result> {
-  const requestId = crypto.randomUUID(); if (debugEnabled.value) console.debug("[MyMedia] request", operation); status.value = "Requesting Fansly…";
-  const result = await new Promise<Result>((resolve) => { const timer = window.setTimeout(() => finish({ type: BRIDGE_RESULT, requestId, operation, ok: false, error: "The page bridge timed out." }), 20_000); function finish(value: Result): void { clearTimeout(timer); window.removeEventListener(BRIDGE_RESULT, listener); resolve(value); } function listener(event: Event): void { const value = (event as CustomEvent<unknown>).detail as Partial<Result>; if (value?.requestId === requestId && value.operation === operation && typeof value.ok === "boolean") finish(value as Result); } window.addEventListener(BRIDGE_RESULT, listener); window.dispatchEvent(new CustomEvent(BRIDGE_COMMAND, { detail: { type: BRIDGE_COMMAND, requestId, operation, ...(groupId ? { groupId } : {}), ...(offset !== undefined ? { offset } : {}), ...(before !== undefined ? { before } : {}) } })); });
-  if (!result.ok) { failed.value++; status.value = result.error ?? "Request failed."; } return result;
+
+function addMedia(items: DiscoveredMedia[] | undefined): void {
+  if (!items) return;
+  const knownIds = new Set(library.value.map((item) => item.accountMediaId));
+  const additions: MediaItem[] = items
+    .filter((item) => !knownIds.has(item.accountMediaId))
+    .map((item) => ({
+      ...item,
+      state: downloadIndex.value[item.mediaId]?.state ?? "ready"
+    }));
+  library.value.push(...additions);
+}
+
+function toggleSelection(id: string): void {
+  const next = new Set(selectedIds.value);
+  if (next.has(id)) next.delete(id);
+  else next.add(id);
+  selectedIds.value = next;
+}
+
+function selectVisible(): void {
+  const next = new Set(selectedIds.value);
+  for (const item of visibleMedia.value) {
+    if (item.state === "ready") next.add(item.accountMediaId);
+  }
+  selectedIds.value = next;
+}
+
+function clearSelection(): void {
+  selectedIds.value = new Set();
+}
+
+async function downloadSelected(): Promise<void> {
+  isDownloading.value = true;
+  pauseDownloadBatch = false;
+
+  for (const item of selectedMedia.value) {
+    if (pauseDownloadBatch) break;
+    updateItemState(item.mediaId, "queued");
+    const result = await chrome.runtime.sendMessage({
+      type: "fansly-mymedia:download",
+      url: item.url,
+      filename: `Fansly MyMedia/${item.accountMediaId}.${item.extension}`,
+      mediaId: item.mediaId
+    }) as BridgeResult;
+    updateItemState(item.mediaId, result.ok ? "downloading" : "failed");
+  }
+
+  isDownloading.value = false;
+  status.value = pauseDownloadBatch
+    ? "Download batch paused. Downloads already started continue in Chrome."
+    : "Selected downloads submitted. Completed files move to Downloaded automatically.";
+}
+
+function pauseDownloads(): void {
+  pauseDownloadBatch = true;
+}
+
+function handleStorageChange(
+  changes: Record<string, chrome.storage.StorageChange>,
+  areaName: string
+): void {
+  if (areaName !== "local" || !changes[DOWNLOAD_INDEX_KEY]) return;
+  downloadIndex.value = (changes[DOWNLOAD_INDEX_KEY].newValue ?? {}) as DownloadIndex;
+  for (const item of library.value) {
+    const state = downloadIndex.value[item.mediaId]?.state;
+    if (state) item.state = state;
+    if (state === "completed") selectedIds.value.delete(item.accountMediaId);
+  }
+}
+
+function updateItemState(mediaId: string, state: MediaItem["state"]): void {
+  const item = library.value.find((candidate) => candidate.mediaId === mediaId);
+  if (item) item.state = state;
+}
+
+function countMedia(kind: MediaKind): number {
+  return library.value.filter((item) => item.kind === kind && !isCompleted(item)).length;
+}
+
+function isCompleted(item: MediaItem): boolean {
+  return item.state === "completed";
+}
+
+async function fetchGroups(offset: number): Promise<{ groups: Group[] }> {
+  const result = await command("groups", { offset });
+  if (!result.ok) throw new Error(result.error ?? "Chat discovery failed.");
+  return result.payload as { groups: Group[] };
+}
+
+async function fetchMedia(
+  groupId: string,
+  before: string
+): Promise<{ offers: { id: string }[]; accountMediaCount: number; downloadableMedia?: unknown[] }> {
+  const result = await command("media", { groupId, before });
+  if (!result.ok) throw new Error(result.error ?? "Media collection failed.");
+  return result.payload as {
+    offers: { id: string }[];
+    accountMediaCount: number;
+    downloadableMedia?: unknown[];
+  };
+}
+
+async function command(
+  operation: "groups" | "media",
+  extra: Record<string, unknown>
+): Promise<BridgeResult> {
+  const requestId = crypto.randomUUID();
+  return new Promise((resolve) => {
+    const timeout = window.setTimeout(
+      () => finish({ ok: false, error: "Request timed out." }),
+      30_000
+    );
+
+    function listener(event: Event): void {
+      const value = (event as CustomEvent<{
+        requestId?: string;
+        ok?: boolean;
+        payload?: unknown;
+        error?: string;
+      }>).detail;
+      if (value?.requestId === requestId) {
+        finish({
+          ok: value.ok === true,
+          payload: value.payload,
+          error: value.error
+        });
+      }
+    }
+
+    function finish(result: BridgeResult): void {
+      window.clearTimeout(timeout);
+      window.removeEventListener("fansly-mymedia:result", listener);
+      resolve(result);
+    }
+
+    window.addEventListener("fansly-mymedia:result", listener);
+    window.dispatchEvent(new CustomEvent("fansly-mymedia:command", {
+      detail: {
+        type: "fansly-mymedia:command",
+        requestId,
+        operation,
+        ...extra
+      }
+    }));
+  });
+}
+
+function errorMessage(error: unknown, fallback: string): string {
+  return error instanceof Error ? error.message : fallback;
 }
 </script>
 
 <template>
-  <section class="fansly-mymedia-panel"><header><div><p>Fansly MyMedia</p><h1>Downloader MVP</h1></div><span :class="`state ${jobState}`">{{ jobState }}</span></header>
-    <div class="controls"><button class="primary" :disabled="running" @click="start">Start</button><button :disabled="!running" @click="pause">Pause</button><button :disabled="!paused" @click="resume">Resume</button><button class="stop" :disabled="!running && !paused" @click="stop">Stop</button></div>
-    <div class="stats"><div><b>{{ groups.length }}</b><small>chats</small></div><div><b>{{ discoveredMedia }}</b><small>discovered</small></div><div><b>{{ completed }}</b><small>completed</small></div><div><b>{{ skipped }}</b><small>skipped</small></div><div><b>{{ failed }}</b><small>failed</small></div></div>
-    <details open><summary>Queue settings</summary><div class="settings"><label>Chat limit<input v-model.number="chatLimit" type="number" min="0"></label><label>Min delay<input v-model.number="minDelay" type="number" min="0"><small>seconds</small></label><label>Max delay<input v-model.number="maxDelay" type="number" min="0"><small>seconds</small></label></div><small>Default 5 (TODO: remove/change after verification); 0 displays all discovered chats.</small><button @click="saveSettings">Save delay preferences</button></details>
-    <details open><summary>Chats and media</summary><div class="controls compact"><button @click="account">Check account</button><button @click="loadGroups">One groups page</button><button @click="loadAllGroups">Discover all chats</button></div><label>Chat ID<input v-model="chatId" inputmode="numeric" placeholder="Select a chat or paste an ID"></label><select v-model="selectedGroup" @change="chooseGroup"><option value="">Loaded chats appear here</option><option v-for="group in shownGroups" :key="group.groupId" :value="group.groupId">{{ group.partnerUsername || "Unknown" }} ({{ group.groupId }})</option></select><div class="controls compact"><button @click="media">Check first MyMedia page</button><button @click="allMedia">Check all MyMedia pages</button></div></details>
-    <details><summary>Download diagnostics</summary><button :disabled="!directVideo" @click="directVideo && download(directVideo.url, directVideo.filename, 'Direct video download started.')">Download highest-quality direct video</button><button :disabled="!dashManifest" @click="dashManifest && download(dashManifest.url, dashManifest.filename, 'DASH manifest downloaded; no segments assembled.')">Download DASH manifest</button><button :disabled="!hlsManifest" @click="hlsManifest && download(hlsManifest.url, hlsManifest.filename, 'HLS manifest downloaded; no segments assembled.')">Download HLS manifest</button></details>
-    <div class="status"><span><b>Partner:</b> {{ currentPartner }}</span><span><b>Cursor:</b> {{ currentCursor }}</span><span><b>Retry:</b> {{ retry }}</span></div><label class="debug"><input v-model="debugEnabled" type="checkbox"> Enable redacted debug logging</label><button :disabled="failed === 0" @click="retryFailed">Retry failed downloads</button><output aria-live="polite">{{ status }}</output><p class="note">No credentials, signed URLs, or download history are displayed or persisted by this panel.</p>
+  <button
+    v-if="!isOpen"
+    class="
+      fixed bottom-5 left-5 z-2147483647 rounded-full bg-violet-600 px-5 py-3
+      font-sans text-sm font-semibold text-white shadow-xl transition
+      hover:bg-violet-500
+      focus:ring-2 focus:ring-violet-300 focus:outline-none
+    "
+    type="button"
+    @click="openLibrary"
+  >
+    MyMedia
+  </button>
+
+  <section
+    v-else
+    class="
+      fixed inset-[3vh_3vw] z-2147483647 flex flex-col overflow-hidden
+      rounded-2xl border border-white/10 bg-zinc-950 font-sans text-zinc-100
+      antialiased shadow-2xl
+    "
+    role="dialog"
+    aria-label="Fansly MyMedia library"
+  >
+    <header class="flex items-center gap-3 border-b border-white/10 px-6 py-4">
+      <div class="mr-auto">
+        <p class="text-xs font-medium tracking-wider text-violet-300 uppercase">
+          Fansly
+        </p>
+        <h1 class="text-xl font-semibold tracking-tight">
+          MyMedia Library
+        </h1>
+      </div>
+      <button
+        class="
+          rounded-lg bg-zinc-800 px-3 py-2 text-sm transition
+          hover:bg-zinc-700
+        "
+        type="button"
+        aria-label="Settings"
+        @click="isSettingsOpen = !isSettingsOpen"
+      >
+        ⚙
+      </button>
+      <button
+        class="
+          rounded-lg bg-zinc-800 px-3 py-2 text-sm transition
+          hover:bg-zinc-700
+        "
+        type="button"
+        aria-label="Close"
+        @click="isOpen = false"
+      >
+        ×
+      </button>
+    </header>
+
+    <div
+      v-if="isSettingsOpen"
+      class="grid max-w-xl gap-5 p-6"
+    >
+      <div>
+        <h2 class="text-lg font-semibold">
+          Collection settings
+        </h2>
+        <p class="mt-1 text-sm text-zinc-400">
+          Delay preferences for future collection runs.
+        </p>
+      </div>
+      <label class="grid gap-2 text-sm">
+        Minimum delay (seconds)
+        <input
+          v-model.number="minDelay"
+          class="rounded-lg border border-white/10 bg-zinc-900 px-3 py-2"
+          type="number"
+          min="1"
+        >
+      </label>
+      <label class="grid gap-2 text-sm">
+        Maximum delay (seconds)
+        <input
+          v-model.number="maxDelay"
+          class="rounded-lg border border-white/10 bg-zinc-900 px-3 py-2"
+          type="number"
+          min="1"
+        >
+      </label>
+    </div>
+
+    <template v-else>
+      <div class="flex items-center gap-4 border-b border-white/10 px-6 py-3">
+        <div class="min-w-0 flex-1">
+          <div class="flex justify-between text-xs text-zinc-400">
+            <span>{{ groups.length }} chats · {{ library.length }} media</span>
+            <span>{{ collectionProgress }}%</span>
+          </div>
+          <div class="mt-2 h-1.5 overflow-hidden rounded-full bg-zinc-800">
+            <div
+              class="h-full rounded-full bg-violet-500 transition-all"
+              :style="{ width: `${collectionProgress}%` }"
+            />
+          </div>
+        </div>
+        <button
+          class="
+            rounded-lg bg-violet-600 px-4 py-2 text-sm font-medium transition
+            hover:bg-violet-500
+          "
+          type="button"
+          @click="isCollecting ? pauseCollection() : collectLibrary()"
+        >
+          {{ isCollecting ? "Pause" : isCollectionPaused ? "Resume" : "Refresh" }}
+        </button>
+      </div>
+
+      <TabsRoot
+        v-model="activeTab"
+        class="flex min-h-0 flex-1 flex-col"
+      >
+        <TabsList class="flex gap-1 border-b border-white/10 px-6">
+          <TabsTrigger
+            class="
+              border-b-2 border-transparent px-4 py-3 text-sm text-zinc-400
+              data-[state=active]:border-violet-400
+              data-[state=active]:text-white
+            "
+            value="image"
+          >
+            Images <span class="ml-1 text-xs">{{ imageCount }}</span>
+          </TabsTrigger>
+          <TabsTrigger
+            class="
+              border-b-2 border-transparent px-4 py-3 text-sm text-zinc-400
+              data-[state=active]:border-violet-400
+              data-[state=active]:text-white
+            "
+            value="video"
+          >
+            Videos <span class="ml-1 text-xs">{{ videoCount }}</span>
+          </TabsTrigger>
+          <TabsTrigger
+            class="
+              border-b-2 border-transparent px-4 py-3 text-sm text-zinc-400
+              data-[state=active]:border-emerald-400
+              data-[state=active]:text-white
+            "
+            value="downloaded"
+          >
+            Downloaded <span class="ml-1 text-xs">{{ downloadedCount }}</span>
+          </TabsTrigger>
+        </TabsList>
+
+        <TabsContent
+          v-for="tab in ['image', 'video', 'downloaded']"
+          :key="tab"
+          :value="tab"
+          class="min-h-0 flex-1 overflow-auto p-6"
+        >
+          <div
+            v-if="visibleMedia.length"
+            class="grid grid-cols-[repeat(auto-fill,minmax(180px,1fr))] gap-4"
+          >
+            <label
+              v-for="item in visibleMedia"
+              :key="item.accountMediaId"
+              class="
+                group overflow-hidden rounded-xl border border-white/10
+                bg-zinc-900 transition
+                hover:border-violet-400/60
+              "
+            >
+              <div class="relative aspect-square bg-zinc-800">
+                <img
+                  v-if="item.previewUrl"
+                  class="size-full object-cover"
+                  :src="item.previewUrl"
+                  loading="lazy"
+                  alt=""
+                >
+                <div
+                  v-else
+                  class="
+                    grid size-full place-items-center text-sm text-zinc-500
+                  "
+                >No preview</div>
+                <input
+                  v-if="activeTab !== 'downloaded'"
+                  class="absolute top-3 left-3 size-5 accent-violet-500"
+                  type="checkbox"
+                  :checked="selectedIds.has(item.accountMediaId)"
+                  :disabled="item.state !== 'ready'"
+                  @change="toggleSelection(item.accountMediaId)"
+                >
+                <span
+                  v-if="item.kind === 'video'"
+                  class="
+                    absolute right-3 bottom-3 rounded-sm bg-black/70 px-2 py-1
+                    text-xs
+                  "
+                >Video</span>
+              </div>
+              <div
+                class="
+                  flex items-center justify-between gap-2 p-3 text-xs
+                  text-zinc-400
+                "
+              >
+                <span>{{ item.width }}×{{ item.height }}</span>
+                <span class="capitalize">{{ item.state }}</span>
+              </div>
+            </label>
+          </div>
+          <div
+            v-else
+            class="
+              grid h-full min-h-56 place-items-center text-sm text-zinc-500
+            "
+          >
+            {{ isCollecting ? "Media will appear here as it is discovered." : "Nothing here yet." }}
+          </div>
+        </TabsContent>
+      </TabsRoot>
+
+      <footer
+        class="
+          flex items-center gap-3 border-t border-white/10 bg-zinc-950 px-6 py-4
+        "
+      >
+        <span class="mr-auto text-sm text-zinc-400">{{ selectedMedia.length }} selected</span>
+        <button
+          class="
+            rounded-lg bg-zinc-800 px-4 py-2 text-sm transition
+            hover:bg-zinc-700
+          "
+          type="button"
+          @click="clearSelection"
+        >
+          Clear
+        </button>
+        <button
+          class="
+            rounded-lg bg-zinc-800 px-4 py-2 text-sm transition
+            hover:bg-zinc-700
+          "
+          type="button"
+          @click="selectVisible"
+        >
+          Select visible
+        </button>
+        <button
+          class="
+            rounded-lg bg-violet-600 px-4 py-2 text-sm font-medium transition
+            hover:bg-violet-500
+            disabled:cursor-not-allowed disabled:opacity-40
+          "
+          type="button"
+          :disabled="selectedMedia.length === 0 || isDownloading"
+          @click="downloadSelected"
+        >
+          Download selected
+        </button>
+        <button
+          class="
+            rounded-lg bg-amber-600 px-4 py-2 text-sm font-medium transition
+            hover:bg-amber-500
+            disabled:cursor-not-allowed disabled:opacity-40
+          "
+          type="button"
+          :disabled="!isDownloading"
+          @click="pauseDownloads"
+        >
+          Pause batch
+        </button>
+      </footer>
+    </template>
+
+    <output class="border-t border-white/10 px-6 py-2 text-xs text-zinc-500">{{ status }}</output>
   </section>
 </template>
-
-<style scoped>
-.fansly-mymedia-panel{width:365px;max-height:88vh;overflow:auto;padding:16px;border:1px solid #4c3c6a;border-radius:14px;background:#17131f;color:#f7f3ff;font:13px/1.4 system-ui,sans-serif;box-shadow:0 16px 48px #0009}.fansly-mymedia-panel *{box-sizing:border-box}header,.controls{display:flex;gap:8px;align-items:center}header{justify-content:space-between}h1,p{margin:0}h1{font-size:18px}header p{color:#bca8e8;font-weight:700;font-size:11px;text-transform:uppercase;letter-spacing:.08em}.state{padding:3px 8px;border-radius:999px;background:#34274c;text-transform:capitalize}.state.running{background:#155934}.state.paused{background:#6a4b09}.state.stopped{background:#722b3b}.controls{flex-wrap:wrap;margin:12px 0 9px}.controls button{flex:1}.compact button{flex:0 1 auto}button{margin-top:8px;padding:7px 9px;border:1px solid #594774;border-radius:8px;background:#2a2136;color:#fff;cursor:pointer}button:hover:not(:disabled){background:#3a2d4b}button:disabled{opacity:.45;cursor:not-allowed}.primary{background:#d3b8ff;color:#17131f;font-weight:700}.stop{border-color:#984457}.stats{display:grid;grid-template-columns:repeat(5,1fr);gap:5px;margin:12px 0}.stats div{text-align:center;padding:7px 3px;border-radius:8px;background:#231c2e}.stats b,.stats small{display:block}.stats b{font-size:16px}small,.note{color:#c0b5cc;font-size:10px}details{margin-top:10px;padding-top:10px;border-top:1px solid #3c304c}summary{font-weight:700;cursor:pointer}label{display:block;margin-top:8px}input,select{display:block;width:100%;margin-top:4px;padding:7px;border:1px solid #594774;border-radius:7px;background:#100d16;color:#fff}.settings{display:grid;grid-template-columns:repeat(3,1fr);gap:7px}.status{display:flex;flex-direction:column;gap:3px;margin:12px 0;padding:9px;border-radius:8px;background:#211a2b;word-break:break-word}.status b{color:#ceb9ed}.debug{display:flex;gap:7px;align-items:center}.debug input{width:auto;margin:0}output{display:block;white-space:pre-wrap;margin-top:12px;padding:9px;border-radius:8px;background:#110e17}.note{margin-top:9px}
-</style>
