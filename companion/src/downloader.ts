@@ -20,14 +20,19 @@ interface ActiveJob {
   job: DownloadJob;
   child: ChildProcessWithoutNullStreams | undefined;
   cancelled: boolean;
+  outputDirectory: string;
   partialPath: string;
 }
 
 type SpawnProcess = typeof spawn;
 
 const MAX_PROBE_OUTPUT_BYTES = 4 * 1024 * 1024;
+const MAX_DIAGNOSTIC_BYTES = 64 * 1024;
+const MAX_MANIFEST_CAPTURE_BYTES = 64 * 1024;
+const FANSLY_ORIGIN = 'https://fansly.com';
+const FANSLY_REFERER = `${FANSLY_ORIGIN}/`;
 
-function safeFailure(error: unknown): string {
+export function safeFailure(error: unknown): string {
   const message = error instanceof Error ? error.message : '';
   if (message === 'NO_VIDEO_STREAM') {
     return 'NO_VIDEO_STREAM: The manifest contains no downloadable video stream.';
@@ -43,6 +48,10 @@ function safeFailure(error: unknown): string {
 
   if (/OUTPUT_EXISTS/iu.test(message)) {
     return 'OUTPUT_EXISTS: A file with this name already exists.';
+  }
+
+  if (/HTTP error 40[13]|Forbidden|Unauthorized/iu.test(message)) {
+    return 'CDN_AUTHORIZATION_FAILED: CloudFront authorization expired or was rejected.';
   }
 
   return 'DOWNLOAD_FAILED: FFmpeg could not download this manifest.';
@@ -67,7 +76,7 @@ export class Downloader {
     private readonly tools: ToolPaths,
     private readonly callbacks: DownloadCallbacks,
     private readonly spawnProcess: SpawnProcess = spawn,
-    private readonly outputRoot = path.join(os.homedir(), 'Downloads', 'Fansly MyMedia'),
+    private readonly downloadsRoot = path.join(os.homedir(), 'Downloads'),
   ) {}
 
   get activeJobId(): string | undefined {
@@ -79,11 +88,13 @@ export class Downloader {
       throw new Error('BUSY');
     }
 
-    const finalPath = path.join(this.outputRoot, job.outputFilename);
+    const outputDirectory = path.join(this.downloadsRoot, job.downloadDirectory);
+    const finalPath = path.join(outputDirectory, job.outputFilename);
     const active: ActiveJob = {
       job,
       cancelled: false,
       child: undefined,
+      outputDirectory,
       partialPath: `${finalPath}.partial`,
     };
     this.active = active;
@@ -114,7 +125,7 @@ export class Downloader {
 
   private async run(active: ActiveJob, finalPath: string): Promise<void> {
     try {
-      await mkdir(this.outputRoot, { recursive: true });
+      await mkdir(active.outputDirectory, { recursive: true });
       if (await fileExists(finalPath)) {
         throw new Error('OUTPUT_EXISTS');
       }
@@ -123,6 +134,10 @@ export class Downloader {
       if (active.cancelled) {
         await this.finishCancelled(active);
         return;
+      }
+
+      if (active.job.debug === true) {
+        await this.inspectManifest(active);
       }
 
       this.callbacks.diagnostic('probe.started', { jobId: active.job.jobId });
@@ -178,11 +193,12 @@ export class Downloader {
   private probe(active: ActiveJob): Promise<ProbeResult> {
     const args = [
       '-v',
-      'error',
+      active.job.debug === true ? 'verbose' : 'error',
       '-show_entries',
       'stream=index,codec_type,codec_name,width,height,bit_rate:format=duration',
       '-of',
       'json',
+      ...buildMediaInputOptions(active.job),
       active.job.manifestUrl,
     ];
 
@@ -204,11 +220,18 @@ export class Downloader {
         }
       });
       child.stderr.on('data', (chunk: Buffer) => {
-        safeDiagnostic += chunk.toString('utf8').slice(0, 1024);
+        safeDiagnostic = appendDiagnostic(safeDiagnostic, chunk);
       });
       child.once('error', reject);
       child.once('close', (code) => {
         active.child = undefined;
+        if (active.job.debug === true && safeDiagnostic.length > 0) {
+          this.callbacks.diagnostic('probe.output', {
+            jobId: active.job.jobId,
+            exitCode: code,
+            output: safeDiagnostic,
+          });
+        }
         if (active.cancelled) {
           reject(new Error('CANCELLED'));
           return;
@@ -239,7 +262,8 @@ export class Downloader {
     const args = [
       '-nostdin',
       '-v',
-      'error',
+      active.job.debug === true ? 'verbose' : 'error',
+      ...buildMediaInputOptions(active.job),
       '-i',
       active.job.manifestUrl,
       '-map',
@@ -280,11 +304,18 @@ export class Downloader {
         }
       });
       child.stderr.on('data', (chunk: Buffer) => {
-        safeDiagnostic += chunk.toString('utf8').slice(0, 2048);
+        safeDiagnostic = appendDiagnostic(safeDiagnostic, chunk);
       });
       child.once('error', reject);
       child.once('close', (code) => {
         active.child = undefined;
+        if (active.job.debug === true && safeDiagnostic.length > 0) {
+          this.callbacks.diagnostic('ffmpeg.output', {
+            jobId: active.job.jobId,
+            exitCode: code,
+            output: safeDiagnostic,
+          });
+        }
         if (active.cancelled) {
           reject(new Error('CANCELLED'));
         } else if (code === 0) {
@@ -296,8 +327,112 @@ export class Downloader {
     });
   }
 
+  private async inspectManifest(active: ActiveJob): Promise<void> {
+    try {
+      const response = await fetch(active.job.manifestUrl, {
+        headers: {
+          Accept: '*/*',
+          ...(active.job.cloudFrontAuth
+            ? { Cookie: buildCloudFrontCookie(active.job.cloudFrontAuth) }
+            : {}),
+          Origin: FANSLY_ORIGIN,
+          Range: `bytes=0-${MAX_MANIFEST_CAPTURE_BYTES - 1}`,
+          Referer: FANSLY_REFERER,
+          'User-Agent': active.job.userAgent,
+        },
+      });
+      const body = await readLimitedResponse(response, MAX_MANIFEST_CAPTURE_BYTES);
+      this.callbacks.diagnostic('manifest.response', {
+        jobId: active.job.jobId,
+        status: response.status,
+        statusText: response.statusText,
+        contentType: response.headers.get('content-type') ?? '',
+        contentLength: response.headers.get('content-length') ?? '',
+        contentRange: response.headers.get('content-range') ?? '',
+        finalUrl: response.url,
+        truncated: body.truncated,
+        body: body.text,
+      });
+    } catch (error) {
+      this.callbacks.diagnostic('manifest.response-failed', {
+        jobId: active.job.jobId,
+        error: redactDiagnostic(error),
+      });
+    }
+  }
+
   private async finishCancelled(active: ActiveJob): Promise<void> {
     await rm(active.partialPath, { force: true });
     this.callbacks.cancelled(active.job.jobId);
   }
+}
+
+export function buildMediaInputOptions(
+  job: Pick<DownloadJob, 'cloudFrontAuth' | 'userAgent'>,
+): string[] {
+  const cloudFrontCookie = job.cloudFrontAuth
+    ? `Cookie: ${buildCloudFrontCookie(job.cloudFrontAuth)}\r\n`
+    : '';
+  return [
+    '-headers',
+    `Origin: ${FANSLY_ORIGIN}\r\nAccept: */*\r\n${cloudFrontCookie}`,
+    '-referer',
+    FANSLY_REFERER,
+    '-user_agent',
+    job.userAgent,
+  ];
+}
+
+function buildCloudFrontCookie(auth: NonNullable<DownloadJob['cloudFrontAuth']>): string {
+  return [
+    `CloudFront-Key-Pair-Id=${auth.keyPairId}`,
+    `CloudFront-Policy=${auth.policy}`,
+    `CloudFront-Signature=${auth.signature}`,
+  ].join('; ');
+}
+
+function appendDiagnostic(current: string, chunk: Buffer): string {
+  if (current.length >= MAX_DIAGNOSTIC_BYTES) {
+    return current;
+  }
+
+  return `${current}${chunk.toString('utf8')}`.slice(0, MAX_DIAGNOSTIC_BYTES);
+}
+
+async function readLimitedResponse(
+  response: Response,
+  maximumBytes: number,
+): Promise<{ text: string; truncated: boolean }> {
+  if (!response.body) {
+    return { text: '', truncated: false };
+  }
+
+  const reader = response.body.getReader() as ReadableStreamDefaultReader<Uint8Array>;
+  const decoder = new TextDecoder();
+  let text = '';
+  let bytesRead = 0;
+  let truncated = false;
+
+  try {
+    while (bytesRead < maximumBytes) {
+      const result = await reader.read();
+      if (result.done) {
+        break;
+      }
+
+      const remaining = maximumBytes - bytesRead;
+      const chunk = result.value.subarray(0, remaining);
+      bytesRead += chunk.byteLength;
+      text += decoder.decode(chunk, { stream: true });
+      if (chunk.byteLength < result.value.byteLength) {
+        truncated = true;
+        break;
+      }
+    }
+  } finally {
+    await reader.cancel().catch(() => undefined);
+  }
+
+  text += decoder.decode();
+  return { text, truncated };
 }

@@ -3,6 +3,8 @@ import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 import { TabsContent, TabsList, TabsRoot, TabsTrigger } from "reka-ui";
 import {
   buildDownloadFilename,
+  DEFAULT_DOWNLOAD_DIRECTORY,
+  normalizeDownloadDirectory,
   formatMediaCreatedAt
 } from "../core/filenames";
 import { mergeUniqueMedia } from "../core/media-library";
@@ -30,7 +32,7 @@ type Group = {
 };
 
 type MediaKind = "image" | "video";
-type LibraryTab = MediaKind | "downloaded";
+type LibraryTab = MediaKind | "downloaded" | "failed";
 
 type DiscoveredMedia = {
   accountMediaId: string;
@@ -90,6 +92,8 @@ const currentChat = ref(0);
 const chatLimit = ref(DEFAULT_CHAT_LIMIT);
 const minDelay = ref(1);
 const maxDelay = ref(5);
+const companionDebug = ref(false);
+const downloadDirectory = ref(DEFAULT_DOWNLOAD_DIRECTORY);
 const sortOrder = ref<MediaSortOrder>("created-desc");
 const hoveredMediaId = ref<string | null>(null);
 const focusedMediaId = ref<string | null>(null);
@@ -109,14 +113,20 @@ const downloadedRecords = computed(() => sortMedia(
   sortOrder.value
 ));
 const downloadedCount = computed(() => downloadedRecords.value.length);
+const failedRecords = computed(() => sortMedia(
+  Object.values(downloadIndex.value).filter((record) => record.state === "failed"),
+  sortOrder.value
+));
+const failedCount = computed(() => failedRecords.value.length);
 const collectionProgress = computed(() => groups.value.length === 0
   ? 0
   : Math.round((currentChat.value / groups.value.length) * 100));
 
 const visibleMedia = computed(() => {
-  if (activeTab.value === "downloaded") return [];
+  if (activeTab.value === "downloaded" || activeTab.value === "failed") return [];
   return sortMedia(
-    library.value.filter((item) => item.kind === activeTab.value && !isCompleted(item)),
+    library.value.filter((item) =>
+      item.kind === activeTab.value && item.state !== "completed" && item.state !== "failed"),
     sortOrder.value
   );
 });
@@ -206,10 +216,14 @@ async function loadSettings(): Promise<void> {
     minDelay?: unknown;
     maxDelay?: unknown;
     sortOrder?: unknown;
+    companionDebug?: unknown;
+    downloadDirectory?: unknown;
   } | undefined;
   chatLimit.value = validInteger(settings?.chatLimit, 1, 100_000, DEFAULT_CHAT_LIMIT);
   minDelay.value = validInteger(settings?.minDelay, 1, 300, 1);
   maxDelay.value = validInteger(settings?.maxDelay, minDelay.value, 300, 5);
+  companionDebug.value = settings?.companionDebug === true;
+  downloadDirectory.value = normalizeDownloadDirectory(settings?.downloadDirectory);
   sortOrder.value = isMediaSortOrder(settings?.sortOrder)
     ? settings.sortOrder
     : "created-desc";
@@ -219,12 +233,15 @@ async function saveSettings(): Promise<void> {
   chatLimit.value = validInteger(chatLimit.value, 1, 100_000, DEFAULT_CHAT_LIMIT);
   minDelay.value = validInteger(minDelay.value, 1, 300, 1);
   maxDelay.value = validInteger(maxDelay.value, minDelay.value, 300, 5);
+  downloadDirectory.value = normalizeDownloadDirectory(downloadDirectory.value);
   await chrome.storage.local.set({
     [SETTINGS_KEY]: {
       chatLimit: chatLimit.value,
       minDelay: minDelay.value,
       maxDelay: maxDelay.value,
-      sortOrder: sortOrder.value
+      sortOrder: sortOrder.value,
+      companionDebug: companionDebug.value,
+      downloadDirectory: downloadDirectory.value
     }
   });
   status.value = `Settings saved. The next collection will process up to ${chatLimit.value} chats.`;
@@ -288,13 +305,17 @@ async function downloadSelected(): Promise<void> {
       filename: buildDownloadFilename({
         mediaId: item.mediaId,
         createdAt: item.createdAt,
-        extension: item.extension
+        extension: item.extension,
+        downloadDirectory: downloadDirectory.value
       }),
+      downloadDirectory: downloadDirectory.value,
       mediaId: item.mediaId,
       originalFilename: item.originalFilename,
       createdAt: item.createdAt,
       likeCount: item.likeCount,
-      price: item.price
+      price: item.price,
+      debug: companionDebug.value,
+      userAgent: navigator.userAgent
     }) as BridgeResult;
     updateItemState(
       item.mediaId,
@@ -308,6 +329,31 @@ async function downloadSelected(): Promise<void> {
   status.value = pauseDownloadBatch
     ? "Download batch paused. Downloads already started continue in Chrome."
     : "Selected downloads submitted. Completed files move to Downloaded automatically.";
+}
+
+async function retryFailed(mediaId: string): Promise<void> {
+  updateItemState(mediaId, "queued");
+  const response = await chrome.runtime.sendMessage({
+    type: "fansly-mymedia:retry-download",
+    mediaId
+  }) as BridgeResult;
+  status.value = response.ok
+    ? "Retry started."
+    : response.error ?? "The download could not be retried.";
+  await refreshDownloadIndex();
+}
+
+async function retryAllFailed(): Promise<void> {
+  isDownloading.value = true;
+  status.value = `Retrying ${failedCount.value} failed downloads…`;
+  const response = await chrome.runtime.sendMessage({
+    type: "fansly-mymedia:retry-all-failed"
+  }) as { ok?: boolean; retried?: number; failed?: number };
+  isDownloading.value = false;
+  await refreshDownloadIndex();
+  status.value = response.ok
+    ? `${response.retried ?? 0} retries completed or started; ${response.failed ?? 0} unavailable.`
+    : "Failed downloads could not be retried.";
 }
 
 async function refreshCompanionStatus(refresh: boolean): Promise<void> {
@@ -376,7 +422,9 @@ async function refreshDownloadIndex(): Promise<void> {
   for (const item of library.value) {
     const state = downloadIndex.value[item.mediaId]?.state;
     if (state) item.state = state;
-    if (state === "completed") selectedIds.value.delete(item.mediaId);
+    if (state === "completed" || state === "failed") {
+      selectedIds.value.delete(item.mediaId);
+    }
   }
 }
 
@@ -386,11 +434,8 @@ function updateItemState(mediaId: string, state: MediaItem["state"]): void {
 }
 
 function countMedia(kind: MediaKind): number {
-  return library.value.filter((item) => item.kind === kind && !isCompleted(item)).length;
-}
-
-function isCompleted(item: MediaItem): boolean {
-  return item.state === "completed";
+  return library.value.filter((item) =>
+    item.kind === kind && item.state !== "completed" && item.state !== "failed").length;
 }
 
 function displayedFilename(record: DownloadRecord): string {
@@ -429,6 +474,12 @@ function downloadedKind(record: DownloadRecord): "Image" | "Video" | "Media" {
     return "Video";
   }
   return "Media";
+}
+
+function recordsForHistoryTab(tab: string): DownloadRecord[] {
+  if (tab === "downloaded") return downloadedRecords.value;
+  if (tab === "failed") return failedRecords.value;
+  return [];
 }
 
 async function fetchGroups(offset: number): Promise<{ groups: Group[] }> {
@@ -662,6 +713,41 @@ function errorMessage(error: unknown, fallback: string): string {
           min="1"
         >
       </label>
+      <label class="grid gap-2 text-sm">
+        Downloads subfolder
+        <input
+          v-model="downloadDirectory"
+          class="rounded-lg border border-white/10 bg-zinc-900 px-3 py-2"
+          type="text"
+          autocomplete="off"
+          placeholder="Fansly MyMedia"
+        >
+        <span class="text-xs text-zinc-500">
+          Relative to Chrome's and Windows' Downloads folders. Nested paths such
+          as Media/Fansly are supported.
+        </span>
+      </label>
+      <label
+        class="
+          flex items-start gap-3 rounded-xl border border-white/10 bg-zinc-900
+          p-4
+        "
+      >
+        <input
+          v-model="companionDebug"
+          class="mt-0.5 size-4 accent-violet-500"
+          type="checkbox"
+        >
+        <span>
+          <span class="block text-sm font-medium text-zinc-100">
+            Detailed companion diagnostics
+          </span>
+          <span class="mt-1 block text-xs/5 text-zinc-400">
+            Captures verbose FFprobe and FFmpeg output plus a sanitized manifest
+            response. Signed URL queries and authorization values remain redacted.
+          </span>
+        </span>
+      </label>
       <button
         class="
           justify-self-start rounded-lg bg-violet-600 px-4 py-2 text-sm
@@ -736,6 +822,15 @@ function errorMessage(error: unknown, fallback: string): string {
           >
             Downloaded <span class="ml-1 text-xs">{{ downloadedCount }}</span>
           </TabsTrigger>
+          <TabsTrigger
+            class="
+              border-b-2 border-transparent px-4 py-3 text-sm text-zinc-400
+              data-[state=active]:border-red-400 data-[state=active]:text-white
+            "
+            value="failed"
+          >
+            Failed <span class="ml-1 text-xs">{{ failedCount }}</span>
+          </TabsTrigger>
           <label class="ml-auto flex items-center gap-2 text-xs text-zinc-400">
             Sort
             <select
@@ -757,17 +852,17 @@ function errorMessage(error: unknown, fallback: string): string {
         </TabsList>
 
         <TabsContent
-          v-for="tab in ['image', 'video', 'downloaded']"
+          v-for="tab in ['image', 'video', 'downloaded', 'failed']"
           :key="tab"
           :value="tab"
           class="min-h-0 flex-1 overflow-auto p-6"
         >
           <div
-            v-if="tab === 'downloaded' && downloadedRecords.length"
+            v-if="recordsForHistoryTab(tab).length"
             class="grid gap-3"
           >
             <article
-              v-for="record in downloadedRecords"
+              v-for="record in recordsForHistoryTab(tab)"
               :key="record.mediaId"
               class="
                 flex items-center gap-4 rounded-xl border border-white/10
@@ -796,6 +891,7 @@ function errorMessage(error: unknown, fallback: string): string {
                 </p>
               </div>
               <span
+                v-if="tab === 'downloaded'"
                 class="
                   rounded-full bg-emerald-500/10 px-3 py-1 text-xs
                   text-emerald-300
@@ -803,10 +899,31 @@ function errorMessage(error: unknown, fallback: string): string {
               >
                 Completed
               </span>
+              <div
+                v-else
+                class="flex max-w-72 flex-col items-end gap-2"
+              >
+                <span class="text-right text-xs text-red-300">
+                  {{ record.error ?? "Download failed." }}
+                </span>
+                <button
+                  class="
+                    rounded-lg bg-red-950 px-3 py-2 text-xs text-red-200
+                    transition
+                    hover:bg-red-900
+                    disabled:cursor-not-allowed disabled:opacity-40
+                  "
+                  type="button"
+                  :disabled="isDownloading"
+                  @click="retryFailed(record.mediaId)"
+                >
+                  Retry
+                </button>
+              </div>
             </article>
           </div>
           <div
-            v-else-if="tab !== 'downloaded' && visibleMedia.length"
+            v-else-if="tab !== 'downloaded' && tab !== 'failed' && visibleMedia.length"
             class="grid grid-cols-[repeat(auto-fill,minmax(180px,1fr))] gap-4"
           >
             <button
@@ -897,9 +1014,11 @@ function errorMessage(error: unknown, fallback: string): string {
             {{
               tab === "downloaded"
                 ? "No completed downloads are stored yet."
-                : isCollecting
-                  ? "Media will appear here as it is discovered."
-                  : "Nothing here yet."
+                : tab === "failed"
+                  ? "No failed downloads."
+                  : isCollecting
+                    ? "Media will appear here as it is discovered."
+                    : "Nothing here yet."
             }}
           </div>
         </TabsContent>
@@ -910,8 +1029,29 @@ function errorMessage(error: unknown, fallback: string): string {
           flex items-center gap-3 border-t border-white/10 bg-zinc-950 px-6 py-4
         "
       >
-        <span class="mr-auto text-sm text-zinc-400">{{ selectedMedia.length }} selected</span>
+        <span
+          v-if="activeTab === 'image' || activeTab === 'video'"
+          class="mr-auto text-sm text-zinc-400"
+        >{{ selectedMedia.length }} selected</span>
+        <span
+          v-else
+          class="mr-auto"
+        />
         <button
+          v-if="activeTab === 'failed'"
+          class="
+            rounded-lg bg-red-950 px-4 py-2 text-sm text-red-200 transition
+            hover:bg-red-900
+            disabled:cursor-not-allowed disabled:opacity-40
+          "
+          type="button"
+          :disabled="failedCount === 0 || isDownloading"
+          @click="retryAllFailed"
+        >
+          Retry all failed
+        </button>
+        <button
+          v-if="activeTab === 'image' || activeTab === 'video'"
           class="
             rounded-lg bg-zinc-800 px-4 py-2 text-sm transition
             hover:bg-zinc-700
@@ -922,6 +1062,7 @@ function errorMessage(error: unknown, fallback: string): string {
           Clear
         </button>
         <button
+          v-if="activeTab === 'image' || activeTab === 'video'"
           class="
             rounded-lg bg-zinc-800 px-4 py-2 text-sm transition
             hover:bg-zinc-700
@@ -932,6 +1073,7 @@ function errorMessage(error: unknown, fallback: string): string {
           Select visible
         </button>
         <button
+          v-if="activeTab === 'image' || activeTab === 'video'"
           class="
             rounded-lg bg-violet-600 px-4 py-2 text-sm font-medium transition
             hover:bg-violet-500
@@ -944,6 +1086,7 @@ function errorMessage(error: unknown, fallback: string): string {
           Download selected
         </button>
         <button
+          v-if="activeTab === 'image' || activeTab === 'video'"
           class="
             rounded-lg bg-amber-600 px-4 py-2 text-sm font-medium transition
             hover:bg-amber-500

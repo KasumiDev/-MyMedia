@@ -25,9 +25,11 @@ describe("download filenames", () => {
     expect(formatMediaCreatedAt(0)).toBe("unknown-date");
   });
 
-  it("rejects paths outside the extension download folder", () => {
+  it("supports safe configured subfolders and rejects traversal", () => {
+    expect(isValidDownloadFilename("Media/Fansly/2026-01-01-123.jpg")).toBe(true);
     expect(isValidDownloadFilename("../unsafe.jpg")).toBe(false);
-    expect(isValidDownloadFilename("Fansly MyMedia/nested/unsafe.jpg")).toBe(false);
+    expect(isValidDownloadFilename("C:/unsafe.jpg")).toBe(false);
+    expect(isValidDownloadFilename("Fansly MyMedia//unsafe.jpg")).toBe(false);
   });
 
   it("keeps a safe display copy of the original filename", () => {

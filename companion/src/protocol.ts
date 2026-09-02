@@ -1,12 +1,22 @@
+export interface CloudFrontAuth {
+  keyPairId: string;
+  policy: string;
+  signature: string;
+}
+
 export interface DownloadJob {
   jobId: string;
   manifestUrl: string;
+  downloadDirectory: string;
   outputFilename: string;
   originalFilename: string;
   createdAt: number;
   likeCount: number;
   price: number;
   previewUrl?: string;
+  debug?: boolean;
+  userAgent: string;
+  cloudFrontAuth?: CloudFrontAuth;
 }
 
 export type NativeRequest =

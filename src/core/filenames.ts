@@ -4,6 +4,8 @@ const WINDOWS_RESERVED_NAMES = new Set([
   ...Array.from({ length: 9 }, (_, index) => `lpt${index + 1}`)
 ]);
 
+export const DEFAULT_DOWNLOAD_DIRECTORY = "Fansly MyMedia";
+
 const FALLBACK_EXTENSION_BY_MIME: Record<string, string> = {
   "image/jpeg": "jpeg",
   "image/jpg": "jpg",
@@ -72,6 +74,7 @@ export interface DownloadFilenameInput {
   mediaId: string;
   createdAt: number;
   extension: string;
+  downloadDirectory?: string;
 }
 
 /** A sortable deterministic filename; media IDs provide collision safety. */
@@ -80,7 +83,32 @@ export function buildDownloadFilename(input: DownloadFilenameInput): string {
   if (!/^[a-z0-9]{1,8}$/.test(extension)) throw new Error("Invalid media filename extension");
   const media = sanitizeFilenameComponent(input.mediaId, "unknown-media");
   const date = formatMediaCreatedAt(input.createdAt);
-  return `Fansly MyMedia/${date}-${media}.${extension}`;
+  const directory = normalizeDownloadDirectory(input.downloadDirectory);
+  return `${directory}/${date}-${media}.${extension}`;
+}
+
+export function normalizeDownloadDirectory(value: unknown): string {
+  if (typeof value !== "string") return DEFAULT_DOWNLOAD_DIRECTORY;
+  const components = value
+    .replace(/\\/g, "/")
+    .split("/")
+    .map((component) => sanitizeFilenameComponent(component, ""))
+    .filter(Boolean);
+  const directory = components.join("/").slice(0, 160);
+  return isValidDownloadDirectory(directory) ? directory : DEFAULT_DOWNLOAD_DIRECTORY;
+}
+
+export function isValidDownloadDirectory(value: unknown): value is string {
+  if (typeof value !== "string" || value.length === 0 || value.length > 160) return false;
+  const components = value.split("/");
+  return components.length <= 8 && components.every((component) =>
+    component.length > 0
+    && component.length <= 80
+    && component !== "."
+    && component !== ".."
+    && !/[<>:"/\\|?*\r\n]/u.test(component)
+    && !WINDOWS_RESERVED_NAMES.has(component.toLowerCase())
+  );
 }
 
 export function formatMediaCreatedAt(createdAt: number): string {
@@ -91,5 +119,10 @@ export function formatMediaCreatedAt(createdAt: number): string {
 
 export function isValidDownloadFilename(value: unknown): value is string {
   if (typeof value !== "string" || value.length > 240) return false;
-  return /^Fansly MyMedia\/[^<>:"/\\|?*\r\n]{1,220}\.[a-z0-9]{1,8}$/u.test(value);
+  const separator = value.lastIndexOf("/");
+  if (separator <= 0) return false;
+  const directory = value.slice(0, separator);
+  const basename = value.slice(separator + 1);
+  return isValidDownloadDirectory(directory)
+    && /^[^<>:"/\\|?*\r\n]{1,180}\.[a-z0-9]{1,8}$/u.test(basename);
 }

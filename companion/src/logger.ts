@@ -3,9 +3,10 @@ import os from 'node:os';
 import path from 'node:path';
 
 const MAX_LOG_BYTES = 1024 * 1024;
-const MAX_VALUE_LENGTH = 2_000;
+const MAX_VALUE_LENGTH = 64 * 1024;
 const URL_PATTERN = /https?:\/\/[^\s'"<>]+/giu;
 const SECRET_PATTERN = /(authorization|cookie|fansly-session-id|policy|signature|key-pair-id)\s*[:=]\s*[^\s,;]+/giu;
+const SIGNED_QUERY_PATTERN = /([?&](?:policy|signature|key-pair-id)=)[^&\s'"<>]*/giu;
 
 export interface DiagnosticLogger {
   readonly path: string;
@@ -52,6 +53,7 @@ export function redactDiagnostic(value: unknown): string {
   return text
     .replace(URL_PATTERN, '[redacted-url]')
     .replace(SECRET_PATTERN, '$1=[redacted]')
+    .replace(SIGNED_QUERY_PATTERN, '$1[redacted]')
     .replace(/[\r\n\t]+/gu, ' ')
     .slice(0, MAX_VALUE_LENGTH);
 }

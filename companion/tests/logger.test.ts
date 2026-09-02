@@ -18,6 +18,26 @@ describe('diagnostic logging', () => {
     expect(diagnostic).toContain('authorization=[redacted]');
   });
 
+  it('redacts signatures on relative manifest entries', () => {
+    const diagnostic = redactDiagnostic(
+      'segment.m4s?Policy=secret&Signature=value&Key-Pair-Id=key',
+    );
+
+    expect(diagnostic).not.toContain('secret');
+    expect(diagnostic).not.toContain('value');
+    expect(diagnostic).not.toContain('=key');
+  });
+
+  it('redacts every CloudFront cookie value from verbose HTTP output', () => {
+    const diagnostic = redactDiagnostic(
+      'Cookie: CloudFront-Key-Pair-Id=key-secret; CloudFront-Policy=policy-secret; CloudFront-Signature=signature-secret',
+    );
+
+    expect(diagnostic).not.toContain('key-secret');
+    expect(diagnostic).not.toContain('policy-secret');
+    expect(diagnostic).not.toContain('signature-secret');
+  });
+
   it('writes JSON lines beneath LocalAppData', () => {
     const localAppData = mkdtempSync(path.join(os.tmpdir(), 'fansly-log-'));
     const logger = createDiagnosticLogger({ LOCALAPPDATA: localAppData }, localAppData);

@@ -1,6 +1,6 @@
 import path from 'node:path';
 
-import type { DownloadJob, NativeRequest } from './protocol.js';
+import type { CloudFrontAuth, DownloadJob, NativeRequest } from './protocol.js';
 
 const CDN_HOST_PATTERN = /^cdn[1-5]\.fansly\.com$/iu;
 const SAFE_ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/u;
@@ -118,18 +118,81 @@ function validateDownloadJob(value: unknown): DownloadJob {
   const job: DownloadJob = {
     jobId: validateId(value.jobId, 'jobId'),
     manifestUrl: validateManifestUrl(value.manifestUrl),
+    downloadDirectory: validateDownloadDirectory(value.downloadDirectory),
     outputFilename: validateOutputFilename(value.outputFilename),
     originalFilename: requireBoundedString(value.originalFilename, 'originalFilename', 512),
     createdAt: requireNonNegativeInteger(value.createdAt, 'createdAt'),
     likeCount: requireNonNegativeInteger(value.likeCount, 'likeCount'),
     price: requireNonNegativeInteger(value.price, 'price'),
+    userAgent: validateUserAgent(value.userAgent),
   };
 
   if (value.previewUrl !== undefined) {
     job.previewUrl = validateCdnUrl(value.previewUrl, 'previewUrl').toString();
   }
+  if (value.debug !== undefined) {
+    if (typeof value.debug !== 'boolean') {
+      throw new ValidationError('debug must be a boolean');
+    }
+    job.debug = value.debug;
+  }
+  if (value.cloudFrontAuth !== undefined) {
+    job.cloudFrontAuth = validateCloudFrontAuth(value.cloudFrontAuth);
+  }
 
   return job;
+}
+
+export function validateDownloadDirectory(value: unknown): string {
+  const directory = requireBoundedString(value, 'downloadDirectory', 160);
+  const components = directory.replace(/\\/gu, '/').split('/');
+  if (
+    components.length > 8
+    || components.some((component) =>
+      component.length === 0
+      || component.length > 80
+      || component === '.'
+      || component === '..'
+      || /[<>:"/\\|?*\r\n]/u.test(component)
+      || WINDOWS_RESERVED_NAME.test(component)
+    )
+  ) {
+    throw new ValidationError('downloadDirectory is not a safe relative path');
+  }
+
+  return components.join(path.sep);
+}
+
+function validateUserAgent(value: unknown): string {
+  const userAgent = requireBoundedString(value, 'userAgent', 512);
+  if (/[\r\n]/u.test(userAgent)) {
+    throw new ValidationError('userAgent contains unsupported characters');
+  }
+  return userAgent;
+}
+
+function validateCloudFrontAuth(value: unknown): CloudFrontAuth {
+  if (!isRecord(value)) {
+    throw new ValidationError('cloudFrontAuth must be an object');
+  }
+
+  return {
+    keyPairId: validateCloudFrontValue(value.keyPairId, 'cloudFrontAuth.keyPairId', 256),
+    policy: validateCloudFrontValue(value.policy, 'cloudFrontAuth.policy', 8192),
+    signature: validateCloudFrontValue(value.signature, 'cloudFrontAuth.signature', 8192),
+  };
+}
+
+function validateCloudFrontValue(
+  value: unknown,
+  field: string,
+  maximumLength: number,
+): string {
+  const text = requireBoundedString(value, field, maximumLength);
+  if (/[;\r\n]/u.test(text)) {
+    throw new ValidationError(`${field} contains unsupported characters`);
+  }
+  return text;
 }
 
 export function validateRequest(value: unknown): NativeRequest {

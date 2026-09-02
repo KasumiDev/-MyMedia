@@ -142,12 +142,23 @@ include the handshake, FFprobe and FFmpeg startup, selected stream indexes,
 completion, cancellation, and redacted failures. Signed manifest URLs and
 authorization-like values are never written.
 
+Enable **Detailed companion diagnostics** in the extension settings before
+starting a test download to additionally record verbose FFprobe/FFmpeg output,
+the manifest HTTP status and safe response headers, and up to 64 KiB of the
+sanitized manifest response. The persisted toggle applies to subsequent jobs.
+Full URLs, signed query values, cookies, and authorization values remain
+redacted even in this mode.
+
 ## Download and security behavior
 
 - The extension sends only an explicitly selected manifest and sanitized output
   metadata.
-- The companion does not receive or persist Fansly session tokens, cookies, or
-  authorization headers.
+- The extension reads only `CloudFront-Key-Pair-Id`, `CloudFront-Policy`, and
+  `CloudFront-Signature` for the selected CDN URL and passes them transiently
+  to the companion. It does not forward Fansly session, device, analytics, or
+  support cookies.
+- CloudFront authorization values are held in memory for the active job and
+  never persisted or included in logs.
 - Signed CDN URLs are short-lived and are never persisted. Logs redact their
   query strings.
 - The native manifests allow only the supplied extension IDs.

@@ -1,14 +1,24 @@
 export const NATIVE_HOST_NAME = "com.fansly.mymedia_companion";
 
+export interface CloudFrontAuth {
+  keyPairId: string;
+  policy: string;
+  signature: string;
+}
+
 export interface NativeDownloadJob {
   jobId: string;
   manifestUrl: string;
+  downloadDirectory: string;
   outputFilename: string;
   originalFilename: string;
   createdAt: number;
   likeCount: number;
   price: number;
   previewUrl?: string;
+  debug?: boolean;
+  userAgent: string;
+  cloudFrontAuth?: CloudFrontAuth;
 }
 
 export type NativeRequest =

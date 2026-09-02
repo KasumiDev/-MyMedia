@@ -47,7 +47,10 @@ export async function upsertDownloadRecord(record: DownloadRecord): Promise<void
 
   await enqueueWrite(async () => {
     const current = await readDownload(valid.mediaId);
-    await putDownload({ ...current, ...valid });
+    await putDownload({
+      ...(current?.thumbnail ? { thumbnail: current.thumbnail } : {}),
+      ...valid
+    });
   });
 }
 

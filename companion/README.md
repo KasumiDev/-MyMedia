@@ -38,8 +38,10 @@ project installer.
 - Writes to `%USERPROFILE%\Downloads\Fansly MyMedia\<name>.partial` and renames
   the file only after a successful download.
 - Removes partial files when a job is cancelled or fails.
-- Does not accept, store, or log account credentials, headers, or session
-  tokens. Signed manifest URLs are passed only to FFmpeg and FFprobe.
+- Accepts only the three short-lived CloudFront authorization values required
+  for CDN media requests. It never receives unrelated Fansly, device,
+  analytics, support, or session cookies. CloudFront values and signed URLs
+  remain in memory and are never stored or logged.
 
 MP4 is preferred. A `.mkv` output filename may be used as a lossless fallback
 when the source codecs cannot be remuxed into MP4. DRM-protected and encrypted
@@ -57,6 +59,10 @@ The log rotates to `companion.previous.log` after reaching 1 MiB. It records
 handshakes, tool startup, selected stream indexes, completion, cancellation,
 and sanitized FFprobe/FFmpeg failures. Signed URLs and authorization-like
 values are removed before writing.
+
+When **Detailed companion diagnostics** is enabled in the extension settings,
+the job also records verbose tool output and a bounded, sanitized manifest
+response. Debug mode never disables credential redaction.
 
 ## Native-messaging protocol
 

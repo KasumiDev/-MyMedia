@@ -3,10 +3,14 @@ import {
   isNativeHostMessage,
   NATIVE_HOST_NAME,
   type NativeCapabilities,
+  type CloudFrontAuth,
   type NativeHostMessage,
   type NativeRequest
 } from "../core/native-protocol";
-import { isValidDownloadFilename } from "../core/filenames";
+import {
+  isValidDownloadDirectory,
+  isValidDownloadFilename
+} from "../core/filenames";
 import {
   updateDownloadByMediaId,
   upsertDownloadRecord
@@ -33,6 +37,7 @@ export interface CompanionStatus {
 export interface CompanionDownloadInput {
   mediaId: string;
   manifestUrl: string;
+  downloadDirectory: string;
   outputFilename: string;
   historyFilename: string;
   originalFilename: string;
@@ -40,6 +45,9 @@ export interface CompanionDownloadInput {
   likeCount: number;
   price: number;
   previewUrl?: string;
+  debug?: boolean;
+  userAgent: string;
+  cloudFrontAuth?: CloudFrontAuth;
 }
 
 interface PendingRequest {
@@ -204,6 +212,7 @@ async function beginActiveDownload(): Promise<void> {
       job: {
         jobId: download.jobId,
         manifestUrl: download.input.manifestUrl,
+        downloadDirectory: download.input.downloadDirectory,
         outputFilename: download.input.outputFilename,
         originalFilename: download.input.originalFilename,
         createdAt: download.input.createdAt,
@@ -211,6 +220,11 @@ async function beginActiveDownload(): Promise<void> {
         price: download.input.price,
         ...(download.input.previewUrl
           ? { previewUrl: download.input.previewUrl }
+          : {}),
+        ...(download.input.debug === true ? { debug: true } : {}),
+        userAgent: download.input.userAgent,
+        ...(download.input.cloudFrontAuth
+          ? { cloudFrontAuth: download.input.cloudFrontAuth }
           : {})
       }
     };
@@ -372,6 +386,7 @@ async function publishDownloadRevision(): Promise<void> {
 function validateDownloadInput(input: CompanionDownloadInput): void {
   if (!/^[A-Za-z0-9_-]{1,128}$/u.test(input.mediaId)
     || !isApprovedManifestUrl(input.manifestUrl)
+    || !isValidDownloadDirectory(input.downloadDirectory)
     || !isSafeNativeFilename(input.outputFilename)
     || !isValidDownloadFilename(input.historyFilename)
     || (input.previewUrl !== undefined && !isApprovedCdnUrl(input.previewUrl))) {
