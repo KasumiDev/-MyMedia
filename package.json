@@ -6,6 +6,7 @@
   "scripts": {
     "build": "wxt build",
     "build:firefox": "wxt build -b firefox",
+    "zip": "wxt zip",
     "zip:firefox": "wxt zip -b firefox",
     "typecheck": "wxt prepare && vue-tsc --noEmit",
     "lint": "eslint .",

@@ -1,12 +1,13 @@
 import { defineConfig } from "wxt";
 import tailwindcss from "@tailwindcss/vite";
+import packageJson from "./package.json";
 
 export default defineConfig({
   modules: ["@wxt-dev/module-vue"],
   vite: () => ({ plugins: [tailwindcss()] }),
   manifest: ({ browser }) => ({
     name: "Fansly MyMedia",
-    version: "0.1.0",
+    version: packageJson.version,
     description: "Collects and downloads media from the signed-in user's MyMedia library.",
     action: {
       default_title: "Open Fansly MyMedia"
