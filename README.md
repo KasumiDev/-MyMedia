@@ -61,7 +61,8 @@ git push --follow-tags
 
 Use `npm version minor` or `npm version major` when appropriate. The release
 workflow verifies that the pushed tag exactly matches the package version, such
-as tag `v0.1.1` for package version `0.1.1`.
+as tag `v0.1.1` for package version `0.1.1`. Version commits use the message
+format `Release Version 0.1.1`.
 
 GitHub Actions verifies the project, packages the Chrome build, creates a GitHub
 release with generated notes, and attaches it as
