@@ -1,11 +1,20 @@
 import { delay, isEmptySuggestion, MAX_EMPTY_SUGGESTION_RETRIES, MAX_RATE_LIMIT_RETRIES, NORMAL_DELAY_MS, randomDelay, RATE_LIMIT_DELAY_MS } from "../core/retry-policy";
 import { selectDiagnosticManifest, selectDownloadableMedia } from "../core/media-parser";
+import { selectCollectionAlbums } from "../core/albums";
 
 const BRIDGE_COMMAND = "fansly-mymedia:command";
 export {};
 const BRIDGE_RESULT = "fansly-mymedia:result";
-type BridgeOperation = "account" | "groups" | "media";
-interface BridgeCommand { type: typeof BRIDGE_COMMAND; requestId: string; operation: BridgeOperation; groupId?: string; offset?: number; before?: string; }
+type BridgeOperation = "account" | "groups" | "media" | "albums" | "albumMedia";
+interface BridgeCommand {
+  type: typeof BRIDGE_COMMAND;
+  requestId: string;
+  operation: BridgeOperation;
+  groupId?: string;
+  albumId?: string;
+  offset?: number;
+  before?: string;
+}
 const isValidGroupId = (value: unknown): value is string => typeof value === "string" && /^\d{6,30}$/.test(value);
 
 declare global {
@@ -38,15 +47,19 @@ function isCommand(value: unknown): value is BridgeCommand {
   if (!value || typeof value !== "object") return false;
   const candidate = value as Partial<BridgeCommand>;
   if (candidate.type !== BRIDGE_COMMAND || typeof candidate.requestId !== "string") return false;
-  if (!["account", "groups", "media"].includes(candidate.operation ?? "")) return false;
+  if (!["account", "groups", "media", "albums", "albumMedia"]
+    .includes(candidate.operation ?? "")) return false;
   if (candidate.operation === "media" && !isValidGroupId(candidate.groupId)) return false;
+  if (candidate.operation === "albumMedia" && !isValidGroupId(candidate.albumId)) {
+    return false;
+  }
   if (candidate.offset !== undefined && (!Number.isInteger(candidate.offset) || candidate.offset < 0 || candidate.offset > 1_000_000)) return false;
   return candidate.before === undefined || (typeof candidate.before === "string" && /^\d{0,30}$/.test(candidate.before));
 }
 
 async function run(command: BridgeCommand): Promise<void> {
   try {
-    const payload = await request(command.operation, command.groupId, command.offset ?? 0, command.before ?? "");
+    const payload = await request(command);
     emit({ type: BRIDGE_RESULT, requestId: command.requestId, operation: command.operation, ok: true, payload });
   } catch (error) {
     // Deliberately return no response body, headers, URL query values, or credentials.
@@ -54,30 +67,47 @@ async function run(command: BridgeCommand): Promise<void> {
   }
 }
 
-async function request(operation: BridgeOperation, groupId?: string, offset = 0, before = ""): Promise<unknown> {
+async function request(command: BridgeCommand): Promise<unknown> {
   const wait = Math.max(0, randomDelay(NORMAL_DELAY_MS) - (Date.now() - lastRequestAt));
   if (wait) await delay(wait);
   lastRequestAt = Date.now();
-  const url = new URL(operation === "account"
+  const url = new URL(command.operation === "account"
     ? "https://apiv3.fansly.com/api/v1/account/me"
-    : operation === "groups"
+    : command.operation === "groups"
       ? "https://apiv3.fansly.com/api/v1/messaging/groups"
-      : "https://apiv3.fansly.com/api/v1/mediaoffers/location");
+      : command.operation === "albums"
+        ? "https://apiv3.fansly.com/api/v1/uservault/albumsnew"
+        : command.operation === "albumMedia"
+          ? "https://apiv3.fansly.com/api/v1/uservault/album/content"
+          : "https://apiv3.fansly.com/api/v1/mediaoffers/location");
 
   url.searchParams.set("ngsw-bypass", "true");
-  if (operation === "groups") {
-    Object.entries({ sortOrder: "1", flags: "0", subscriptionTierId: "", listIds: "", search: "", limit: "30", offset: String(offset) })
+  if (command.operation === "groups") {
+    Object.entries({ sortOrder: "1", flags: "0", subscriptionTierId: "", listIds: "", search: "", limit: "30", offset: String(command.offset ?? 0) })
       .forEach(([key, value]) => url.searchParams.set(key, value));
   }
-  if (operation === "media") {
-    Object.entries({ locationId: groupId!, locationType: "4001", accountId: await accountId(), mediaType: "", before, after: "0", limit: "30", offset: "0" })
+  if (command.operation === "albums") {
+    url.searchParams.set("accountId", "");
+  }
+  if (command.operation === "albumMedia") {
+    Object.entries({ albumId: command.albumId!, before: command.before || "0", after: "0", limit: "25" })
+      .forEach(([key, value]) => url.searchParams.set(key, value));
+  }
+  if (command.operation === "media") {
+    Object.entries({ locationId: command.groupId!, locationType: "4001", accountId: await accountId(), mediaType: "", before: command.before ?? "", after: "0", limit: "30", offset: "0" })
       .forEach(([key, value]) => url.searchParams.set(key, value));
   }
 
   if (!sessionHeaders.has("authorization")) {
     throw new Error("Fansly session data is not available yet. Reload the Fansly page, wait for it to finish loading, then try again.");
   }
-  return sanitize(operation, await fetchJsonWithRetry(url, operation === "media"));
+  return sanitize(
+    command.operation,
+    await fetchJsonWithRetry(
+      url,
+      command.operation === "media" || command.operation === "albumMedia"
+    )
+  );
 }
 
 async function fetchJsonWithRetry(url: URL, retryEmptySuggestion: boolean): Promise<unknown> {
@@ -135,8 +165,20 @@ function sanitize(operation: BridgeOperation, json: unknown): unknown {
     const groups = requiredArray(response, ["groups", "data"], "Chat groups response was malformed");
     return { count: groups.length, groups: groups.slice(0, 30).map(groupSummary).filter(Boolean) };
   }
+  if (operation === "albums") {
+    const albums = requiredArray(response, ["albums"], "Albums response was malformed");
+    return {
+      albums: selectCollectionAlbums(albums)
+    };
+  }
   const mediaResponse = response as { data?: unknown; aggregationData?: { accountMedia?: unknown } };
-  const data = requiredArray(mediaResponse, ["data"], "MyMedia response was malformed");
+  const data = requiredArray(
+    mediaResponse,
+    operation === "albumMedia" ? ["albumContent"] : ["data"],
+    operation === "albumMedia"
+      ? "Album content response was malformed"
+      : "MyMedia response was malformed"
+  );
   const media = requiredArray(mediaResponse?.aggregationData, ["accountMedia"], "MyMedia aggregation response was malformed");
   const downloadableMedia = selectDownloadableMedia(media);
   const video = downloadableMedia.filter((item) => item.kind === "video")[0] ?? null;

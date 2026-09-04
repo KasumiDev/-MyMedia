@@ -602,6 +602,7 @@ async function updateHistory(
     mediaId: job.mediaId,
     accountMediaId: job.accountMediaId,
     sourceGroupId: job.sourceGroupId,
+    sourceType: job.sourceType,
     filename: job.historyFilename,
     originalFilename: job.originalFilename,
     createdAt: job.createdAt,
@@ -640,6 +641,8 @@ function parseJob(value: unknown): BrowserDownloadJob | null {
     && typeof job.mediaId === "string"
     && typeof job.accountMediaId === "string"
     && typeof job.sourceGroupId === "string"
+    && (job.sourceType === undefined || job.sourceType === "chat"
+      || job.sourceType === "album")
     && typeof job.sourceUrl === "string"
     && typeof job.outputFilename === "string"
     && typeof job.historyFilename === "string"
@@ -648,7 +651,7 @@ function parseJob(value: unknown): BrowserDownloadJob | null {
     && typeof job.likeCount === "number"
     && typeof job.price === "number"
     && typeof job.debug === "boolean"
-    ? job as BrowserDownloadJob
+    ? { ...job, sourceType: job.sourceType ?? "chat" } as BrowserDownloadJob
     : null;
 }
 

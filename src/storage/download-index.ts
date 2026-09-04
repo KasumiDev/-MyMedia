@@ -5,6 +5,7 @@ export interface DownloadRecord {
   mediaId: string;
   accountMediaId?: string;
   sourceGroupId?: string;
+  sourceType?: "chat" | "album";
   filename: string;
   originalFilename?: string;
   createdAt?: number;
@@ -243,6 +244,7 @@ function publicRecord(record: StoredDownload): DownloadRecord {
     ...(record.sourceGroupId === undefined
       ? {}
       : { sourceGroupId: record.sourceGroupId }),
+    ...(record.sourceType === undefined ? {} : { sourceType: record.sourceType }),
     filename: record.filename,
     ...(record.originalFilename === undefined
       ? {}
@@ -277,6 +279,8 @@ function parseDownloadRecord(value: unknown): DownloadRecord | null {
   }
   if (value.accountMediaId !== undefined && !isSafeId(value.accountMediaId)) return null;
   if (value.sourceGroupId !== undefined && !isSafeGroupId(value.sourceGroupId)) return null;
+  if (value.sourceType !== undefined
+    && value.sourceType !== "chat" && value.sourceType !== "album") return null;
   if (value.createdAt !== undefined && !isFiniteTimestamp(value.createdAt)) return null;
   if (value.likeCount !== undefined && !isNonNegativeInteger(value.likeCount)) return null;
   if (value.price !== undefined && !isNonNegativeInteger(value.price)) return null;
@@ -294,6 +298,7 @@ function parseDownloadRecord(value: unknown): DownloadRecord | null {
     ...(value.sourceGroupId === undefined
       ? {}
       : { sourceGroupId: value.sourceGroupId }),
+    ...(value.sourceType === undefined ? {} : { sourceType: value.sourceType }),
     filename: value.filename,
     ...(value.originalFilename === undefined
       ? {}

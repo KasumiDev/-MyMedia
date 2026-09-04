@@ -22,7 +22,8 @@ moved. Keep the folder in place when updating or using the extension.
 
 ## Features
 
-- Discovers media from the user's chats with configurable collection limits.
+- Discovers media from chats and optionally from the built-in Purchases and
+  Likes collections.
 - Lists images, videos, completed downloads, and failed downloads separately.
 - Selects the highest available HLS video quality and streams it to MP4.
 - Shows batch and per-file progress without buffering the complete video in RAM.

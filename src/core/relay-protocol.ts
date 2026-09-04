@@ -1,11 +1,12 @@
 export const BRIDGE_RELAY_REQUEST = "fansly-mymedia:relay-command";
 
-export type BridgeRelayOperation = "groups" | "media";
+export type BridgeRelayOperation = "groups" | "media" | "albums" | "albumMedia";
 
 export interface BridgeRelayRequest {
   type: typeof BRIDGE_RELAY_REQUEST;
   operation: BridgeRelayOperation;
   groupId?: string;
+  albumId?: string;
   offset?: number;
   before?: string;
 }
@@ -20,7 +21,15 @@ export function parseRelayRequest(value: unknown): BridgeRelayRequest | null {
   if (!value || typeof value !== "object") return null;
   const request = value as Partial<BridgeRelayRequest>;
   if (request.type !== BRIDGE_RELAY_REQUEST
-    || (request.operation !== "groups" && request.operation !== "media")) return null;
+    || !["groups", "media", "albums", "albumMedia"].includes(
+      request.operation ?? ""
+    )) return null;
+  if (request.operation === "albums") {
+    return {
+      type: BRIDGE_RELAY_REQUEST,
+      operation: "albums"
+    };
+  }
   if (request.operation === "groups") {
     return Number.isInteger(request.offset) && Number(request.offset) >= 0
       && Number(request.offset) <= 1_000_000
@@ -31,13 +40,22 @@ export function parseRelayRequest(value: unknown): BridgeRelayRequest | null {
         }
       : null;
   }
-  return typeof request.groupId === "string" && /^\d{6,30}$/u.test(request.groupId)
-    && typeof request.before === "string" && /^\d{0,30}$/u.test(request.before)
+  const locationId = request.operation === "media" ? request.groupId : request.albumId;
+  if (typeof locationId !== "string" || !/^\d{6,30}$/u.test(locationId)
+    || typeof request.before !== "string" || !/^\d{0,30}$/u.test(request.before)) {
+    return null;
+  }
+  return request.operation === "media"
     ? {
         type: BRIDGE_RELAY_REQUEST,
         operation: "media",
-        groupId: request.groupId,
+        groupId: locationId,
         before: request.before
       }
-    : null;
+    : {
+        type: BRIDGE_RELAY_REQUEST,
+        operation: "albumMedia",
+        albumId: locationId,
+        before: request.before
+      };
 }

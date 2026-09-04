@@ -9,6 +9,7 @@ export interface BrowserDownloadJob {
   mediaId: string;
   accountMediaId: string;
   sourceGroupId: string;
+  sourceType: "chat" | "album";
   sourceUrl: string;
   outputFilename: string;
   historyFilename: string;

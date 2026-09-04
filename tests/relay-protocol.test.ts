@@ -32,6 +32,27 @@ describe("extension-page relay protocol", () => {
     });
   });
 
+  it("accepts album discovery and album media pagination", () => {
+    expect(parseRelayRequest({
+      type: BRIDGE_RELAY_REQUEST,
+      operation: "albums"
+    })).toEqual({
+      type: BRIDGE_RELAY_REQUEST,
+      operation: "albums"
+    });
+    expect(parseRelayRequest({
+      type: BRIDGE_RELAY_REQUEST,
+      operation: "albumMedia",
+      albumId: "100000000000000002",
+      before: "100000000000000013"
+    })).toEqual({
+      type: BRIDGE_RELAY_REQUEST,
+      operation: "albumMedia",
+      albumId: "100000000000000002",
+      before: "100000000000000013"
+    });
+  });
+
   it("rejects malformed operations and identifiers", () => {
     expect(parseRelayRequest({
       type: BRIDGE_RELAY_REQUEST,
@@ -42,6 +63,12 @@ describe("extension-page relay protocol", () => {
       type: BRIDGE_RELAY_REQUEST,
       operation: "media",
       groupId: "../../other",
+      before: ""
+    })).toBeNull();
+    expect(parseRelayRequest({
+      type: BRIDGE_RELAY_REQUEST,
+      operation: "albumMedia",
+      albumId: "not-an-id",
       before: ""
     })).toBeNull();
   });

@@ -59,6 +59,7 @@ async function relayToPage(
         requestId,
         operation: request.operation,
         ...(request.groupId ? { groupId: request.groupId } : {}),
+        ...(request.albumId ? { albumId: request.albumId } : {}),
         ...(request.offset === undefined ? {} : { offset: request.offset }),
         ...(request.before === undefined ? {} : { before: request.before })
       }

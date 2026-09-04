@@ -52,6 +52,7 @@ export function installServiceWorker(): void {
       mediaId?: unknown;
       accountMediaId?: unknown;
       sourceGroupId?: unknown;
+      sourceType?: unknown;
       previewUrl?: unknown;
       manifestUrl?: unknown;
       originalFilename?: unknown;
@@ -99,11 +100,12 @@ export function installServiceWorker(): void {
       const mediaId = validMediaId(request.mediaId);
       const accountMediaId = validMediaId(request.accountMediaId);
       const sourceGroupId = validGroupId(request.sourceGroupId);
+      const sourceType = validSourceType(request.sourceType);
       const previewUrl = validMediaUrl(request.previewUrl);
       const manifestUrl = validMediaUrl(request.manifestUrl);
       const metadata = validDownloadMetadata(request);
       const downloadDirectory = validDownloadDirectory(request.downloadDirectory);
-      if (!filename || !mediaId || !accountMediaId || !sourceGroupId
+      if (!filename || !mediaId || !accountMediaId || !sourceGroupId || !sourceType
         || !metadata || !downloadDirectory
         || !filename.startsWith(`${downloadDirectory}/`)) {
         sendResponse({
@@ -127,6 +129,7 @@ export function installServiceWorker(): void {
         mediaId,
         accountMediaId,
         sourceGroupId,
+        sourceType,
         ...metadata,
         debug: request.debug === true
       };
@@ -159,6 +162,7 @@ async function queueBrowserDownload(
     mediaId: input.mediaId,
     accountMediaId: input.accountMediaId,
     sourceGroupId: input.sourceGroupId,
+    sourceType: input.sourceType,
     filename: input.historyFilename,
     originalFilename: input.originalFilename,
     createdAt: input.createdAt,
@@ -216,6 +220,10 @@ function validMediaId(value: unknown): string | null {
 
 function validGroupId(value: unknown): string | null {
   return typeof value === "string" && /^\d{6,30}$/u.test(value) ? value : null;
+}
+
+function validSourceType(value: unknown): "chat" | "album" | null {
+  return value === "chat" || value === "album" ? value : null;
 }
 
 async function openLibraryPage(): Promise<void> {

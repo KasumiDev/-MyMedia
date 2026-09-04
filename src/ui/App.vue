@@ -2,6 +2,11 @@
 import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 import { TabsContent, TabsList, TabsRoot, TabsTrigger } from "reka-ui";
 import {
+  LIKES_ALBUM_TYPE,
+  PURCHASES_ALBUM_TYPE,
+  type CollectionAlbum
+} from "../core/albums";
+import {
   buildDownloadFilename,
   DEFAULT_DOWNLOAD_DIRECTORY,
   normalizeDownloadDirectory,
@@ -38,6 +43,10 @@ type Group = {
   partnerUsername: string;
 };
 
+type Album = CollectionAlbum;
+
+type MediaSourceType = "chat" | "album";
+
 type MediaKind = "image" | "video";
 type LibraryTab = MediaKind | "downloaded" | "failed";
 
@@ -62,6 +71,7 @@ type DiscoveredMedia = {
 
 type MediaItem = DiscoveredMedia & {
   sourceGroupId: string;
+  sourceType: MediaSourceType;
   state: DownloadState | "ready";
 };
 
@@ -78,12 +88,16 @@ const isCollectionPaused = ref(false);
 const isDownloading = ref(false);
 const activeTab = ref<LibraryTab>("image");
 const groups = ref<Group[]>([]);
+const albums = ref<Album[]>([]);
 const library = ref<MediaItem[]>([]);
 const selectedIds = ref(new Set<string>());
 const downloadIndex = ref<DownloadIndex>({});
 const status = ref("Preparing the media library…");
 const currentChat = ref(0);
+const collectionSourceCount = ref(0);
 const chatLimit = ref(DEFAULT_CHAT_LIMIT);
+const includeLikes = ref(false);
+const includePurchases = ref(false);
 const minDelay = ref(1);
 const maxDelay = ref(5);
 const companionDebug = ref(false);
@@ -119,9 +133,9 @@ const failedRecords = computed(() => sortMedia(
   sortOrder.value
 ));
 const failedCount = computed(() => failedRecords.value.length);
-const collectionProgress = computed(() => groups.value.length === 0
+const collectionProgress = computed(() => collectionSourceCount.value === 0
   ? 0
-  : Math.round((currentChat.value / groups.value.length) * 100));
+  : Math.round((currentChat.value / collectionSourceCount.value) * 100));
 
 const visibleMedia = computed(() => {
   if (activeTab.value === "downloaded" || activeTab.value === "failed") return [];
@@ -160,6 +174,7 @@ async function collectLibrary(): Promise<void> {
   isCollecting.value = true;
   isCollectionPaused.value = false;
   currentChat.value = 0;
+  collectionSourceCount.value = 0;
   status.value = "Discovering chats…";
 
   try {
@@ -169,6 +184,17 @@ async function collectLibrary(): Promise<void> {
       signal: collectionController.signal
     });
     await chrome.storage.local.set({ "fansly-mymedia:chats": groups.value });
+
+    albums.value = [];
+    if (includeLikes.value || includePurchases.value) {
+      status.value = "Discovering media collections…";
+      const response = await fetchAlbums();
+      albums.value = response.albums.filter((album) =>
+        (album.type === LIKES_ALBUM_TYPE && includeLikes.value)
+        || (album.type === PURCHASES_ALBUM_TYPE && includePurchases.value));
+      await chrome.storage.local.set({ "fansly-mymedia:albums": albums.value });
+    }
+    collectionSourceCount.value = groups.value.length + albums.value.length;
 
     for (const [index, group] of groups.value.entries()) {
       if (collectionController.signal.aborted) break;
@@ -180,7 +206,25 @@ async function collectLibrary(): Promise<void> {
           signal: collectionController.signal,
           onPage: (page) => addMedia(
             page.downloadableMedia as DiscoveredMedia[] | undefined,
-            group.groupId
+            group.groupId,
+            "chat"
+          )
+        }
+      );
+    }
+
+    for (const [index, album] of albums.value.entries()) {
+      if (collectionController.signal.aborted) break;
+      currentChat.value = groups.value.length + index + 1;
+      status.value = `Collecting ${album.title}…`;
+      await paginateMedia(
+        (before) => fetchAlbumMedia(album.id, before),
+        {
+          signal: collectionController.signal,
+          onPage: (page) => addMedia(
+            page.downloadableMedia as DiscoveredMedia[] | undefined,
+            album.id,
+            "album"
           )
         }
       );
@@ -212,11 +256,15 @@ async function loadSettings(): Promise<void> {
     sortOrder?: unknown;
     companionDebug?: unknown;
     downloadDirectory?: unknown;
+    includeLikes?: unknown;
+    includePurchases?: unknown;
   } | undefined;
   chatLimit.value = validInteger(settings?.chatLimit, 1, 100_000, DEFAULT_CHAT_LIMIT);
   minDelay.value = validInteger(settings?.minDelay, 1, 300, 1);
   maxDelay.value = validInteger(settings?.maxDelay, minDelay.value, 300, 5);
   companionDebug.value = settings?.companionDebug === true;
+  includeLikes.value = settings?.includeLikes === true;
+  includePurchases.value = settings?.includePurchases === true;
   downloadDirectory.value = normalizeDownloadDirectory(settings?.downloadDirectory);
   sortOrder.value = isMediaSortOrder(settings?.sortOrder)
     ? settings.sortOrder
@@ -235,7 +283,9 @@ async function saveSettings(): Promise<void> {
       maxDelay: maxDelay.value,
       sortOrder: sortOrder.value,
       companionDebug: companionDebug.value,
-      downloadDirectory: downloadDirectory.value
+      downloadDirectory: downloadDirectory.value,
+      includeLikes: includeLikes.value,
+      includePurchases: includePurchases.value
     }
   });
   status.value = `Settings saved. The next collection will process up to ${chatLimit.value} chats.`;
@@ -252,11 +302,16 @@ function validInteger(
     : fallback;
 }
 
-function addMedia(items: DiscoveredMedia[] | undefined, sourceGroupId: string): void {
+function addMedia(
+  items: DiscoveredMedia[] | undefined,
+  sourceGroupId: string,
+  sourceType: MediaSourceType
+): void {
   if (!items) return;
   const additions: MediaItem[] = items.map((item) => ({
     ...item,
     sourceGroupId,
+    sourceType,
     state: downloadIndex.value[item.mediaId]?.state ?? "ready"
   }));
   library.value = mergeUniqueMedia(library.value, additions);
@@ -366,6 +421,7 @@ async function queueMediaDownload(
     mediaId: historyMediaId,
     accountMediaId: item.accountMediaId,
     sourceGroupId: item.sourceGroupId,
+    sourceType: item.sourceType,
     originalFilename: item.originalFilename,
     createdAt: item.createdAt,
     likeCount: item.likeCount,
@@ -380,24 +436,34 @@ async function rediscoverFailedRecords(
   records: DownloadRecord[]
 ): Promise<Map<string, MediaItem>> {
   const found = new Map<string, MediaItem>();
-  const knownByGroup = new Map<string, DownloadRecord[]>();
+  const knownBySource = new Map<string, {
+    id: string;
+    type: MediaSourceType;
+    records: DownloadRecord[];
+  }>();
   const unknown: DownloadRecord[] = [];
 
   for (const record of records) {
     const current = library.value.find((item) => item.mediaId === record.mediaId);
-    const groupId = record.sourceGroupId ?? current?.sourceGroupId;
-    if (!groupId) {
+    const sourceId = record.sourceGroupId ?? current?.sourceGroupId;
+    const sourceType = record.sourceType ?? current?.sourceType ?? "chat";
+    if (!sourceId) {
       unknown.push(record);
       continue;
     }
-    const grouped = knownByGroup.get(groupId) ?? [];
-    grouped.push(record);
-    knownByGroup.set(groupId, grouped);
+    const key = `${sourceType}:${sourceId}`;
+    const source = knownBySource.get(key) ?? {
+      id: sourceId,
+      type: sourceType,
+      records: []
+    };
+    source.records.push(record);
+    knownBySource.set(key, source);
   }
 
-  for (const [groupId, targets] of knownByGroup) {
-    status.value = `Refreshing ${targets.length} failed media from chat ${groupId}…`;
-    const matches = await findMediaInGroup(groupId, targets);
+  for (const source of knownBySource.values()) {
+    status.value = `Refreshing ${source.records.length} failed media from ${source.type} ${source.id}…`;
+    const matches = await findMediaInSource(source.id, source.type, source.records);
     for (const [mediaId, item] of matches) found.set(mediaId, item);
   }
 
@@ -407,7 +473,7 @@ async function rediscoverFailedRecords(
       const unresolved = unknown.filter((record) => !found.has(record.mediaId));
       if (unresolved.length === 0) break;
       status.value = `Locating ${unresolved.length} failed media in ${group.partnerUsername || group.groupId}…`;
-      const matches = await findMediaInGroup(group.groupId, unresolved);
+      const matches = await findMediaInSource(group.groupId, "chat", unresolved);
       for (const [mediaId, item] of matches) found.set(mediaId, item);
     }
   }
@@ -415,8 +481,9 @@ async function rediscoverFailedRecords(
   return found;
 }
 
-async function findMediaInGroup(
-  groupId: string,
+async function findMediaInSource(
+  sourceId: string,
+  sourceType: MediaSourceType,
   targets: DownloadRecord[]
 ): Promise<Map<string, MediaItem>> {
   const found = new Map<string, MediaItem>();
@@ -424,7 +491,9 @@ async function findMediaInGroup(
   let before = "";
 
   for (;;) {
-    const page = await fetchMedia(groupId, before);
+    const page = sourceType === "album"
+      ? await fetchAlbumMedia(sourceId, before)
+      : await fetchMedia(sourceId, before);
     const items = (page.downloadableMedia ?? []) as DiscoveredMedia[];
     for (const record of targets) {
       if (found.has(record.mediaId)) continue;
@@ -435,7 +504,8 @@ async function findMediaInGroup(
       if (match) {
         found.set(record.mediaId, {
           ...match,
-          sourceGroupId: groupId,
+          sourceGroupId: sourceId,
+          sourceType,
           state: "ready"
         });
       }
@@ -559,6 +629,12 @@ async function fetchGroups(offset: number): Promise<{ groups: Group[] }> {
   return result.payload as { groups: Group[] };
 }
 
+async function fetchAlbums(): Promise<{ albums: Album[] }> {
+  const result = await command("albums", {});
+  if (!result.ok) throw new Error(result.error ?? "Album discovery failed.");
+  return result.payload as { albums: Album[] };
+}
+
 async function fetchMedia(
   groupId: string,
   before: string
@@ -572,8 +648,25 @@ async function fetchMedia(
   };
 }
 
+async function fetchAlbumMedia(
+  albumId: string,
+  before: string
+): Promise<{
+  offers: { id: string }[];
+  accountMediaCount: number;
+  downloadableMedia?: unknown[];
+}> {
+  const result = await command("albumMedia", { albumId, before });
+  if (!result.ok) throw new Error(result.error ?? "Album collection failed.");
+  return result.payload as {
+    offers: { id: string }[];
+    accountMediaCount: number;
+    downloadableMedia?: unknown[];
+  };
+}
+
 async function command(
-  operation: "groups" | "media",
+  operation: "groups" | "media" | "albums" | "albumMedia",
   extra: Record<string, unknown>
 ): Promise<BridgeResult> {
   const tabs = await chrome.tabs.query({ url: "https://fansly.com/*" });
@@ -771,6 +864,51 @@ function errorMessage(error: unknown, fallback: string): string {
           Only the first {{ chatLimit }} chats will be scanned for media.
         </span>
       </label>
+      <fieldset class="grid gap-3">
+        <legend class="text-sm font-medium">
+          Additional collections
+        </legend>
+        <label
+          class="
+            flex items-start gap-3 rounded-xl border border-white/10 bg-zinc-900
+            p-4
+          "
+        >
+          <input
+            v-model="includePurchases"
+            class="mt-0.5 size-4 accent-violet-500"
+            type="checkbox"
+          >
+          <span>
+            <span class="block text-sm font-medium text-zinc-100">
+              Include Purchases
+            </span>
+            <span class="mt-1 block text-xs/5 text-zinc-400">
+              Scan media saved in Fansly's built-in Purchases collection.
+            </span>
+          </span>
+        </label>
+        <label
+          class="
+            flex items-start gap-3 rounded-xl border border-white/10 bg-zinc-900
+            p-4
+          "
+        >
+          <input
+            v-model="includeLikes"
+            class="mt-0.5 size-4 accent-violet-500"
+            type="checkbox"
+          >
+          <span>
+            <span class="block text-sm font-medium text-zinc-100">
+              Include Likes
+            </span>
+            <span class="mt-1 block text-xs/5 text-zinc-400">
+              Scan media saved in Fansly's built-in Likes collection.
+            </span>
+          </span>
+        </label>
+      </fieldset>
       <label class="grid gap-2 text-sm">
         Minimum delay (seconds)
         <input
@@ -827,7 +965,11 @@ function errorMessage(error: unknown, fallback: string): string {
       <div class="flex items-center gap-4 border-b border-white/10 px-6 py-3">
         <div class="min-w-0 flex-1">
           <div class="flex justify-between text-xs text-zinc-400">
-            <span>{{ groups.length }} chats · {{ library.length }} media</span>
+            <span>
+              {{ groups.length }} chats
+              <template v-if="albums.length"> · {{ albums.length }} collections</template>
+              · {{ library.length }} media
+            </span>
             <span>{{ collectionProgress }}%</span>
           </div>
           <div class="mt-2 h-1.5 overflow-hidden rounded-full bg-zinc-800">
