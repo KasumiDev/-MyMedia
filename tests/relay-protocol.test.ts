@@ -53,6 +53,32 @@ describe("extension-page relay protocol", () => {
     });
   });
 
+  it("accepts a partner account when requesting received chat media", () => {
+    expect(parseRelayRequest({
+      type: BRIDGE_RELAY_REQUEST,
+      operation: "media",
+      groupId: "100000000000000001",
+      accountId: "100000000000000002",
+      before: ""
+    })).toEqual({
+      type: BRIDGE_RELAY_REQUEST,
+      operation: "media",
+      groupId: "100000000000000001",
+      accountId: "100000000000000002",
+      before: ""
+    });
+  });
+
+  it("rejects an invalid partner account ID", () => {
+    expect(parseRelayRequest({
+      type: BRIDGE_RELAY_REQUEST,
+      operation: "media",
+      groupId: "100000000000000001",
+      accountId: "invalid",
+      before: ""
+    })).toBeNull();
+  });
+
   it("rejects malformed operations and identifiers", () => {
     expect(parseRelayRequest({
       type: BRIDGE_RELAY_REQUEST,

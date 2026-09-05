@@ -26,6 +26,14 @@ describe("download filenames", () => {
   });
 
   it("supports safe configured subfolders and rejects traversal", () => {
+    expect(buildDownloadFilename({
+      mediaId: "100000000000000011",
+      createdAt: 1_767_225_600,
+      extension: "jpg",
+      downloadDirectory: "Downloads/Received/Creator Name"
+    })).toBe(
+      "Downloads/Received/Creator-Name/2026-01-01-100000000000000011.jpg"
+    );
     expect(isValidDownloadFilename("Media/Fansly/2026-01-01-123.jpg")).toBe(true);
     expect(isValidDownloadFilename("../unsafe.jpg")).toBe(false);
     expect(isValidDownloadFilename("C:/unsafe.jpg")).toBe(false);

@@ -5,6 +5,9 @@ export type DirectMediaKind = "image" | "video";
 export interface DownloadableMedia {
   accountMediaId: string;
   mediaId: string;
+  ownerAccountId: string;
+  creatorName: string | null;
+  mediaBundleId: string | null;
   kind: DirectMediaKind;
   mimetype: string;
   url: string;
@@ -71,6 +74,9 @@ function selectAccountMedia(value: unknown): DownloadableMedia[] {
   const accountMediaId = idFrom(record, "id");
   const media = record.media;
   if (!accountMediaId || !isRecord(media)) return [];
+  const ownerAccountId = idFrom(record, "accountId")
+    ?? idFrom(media, "accountId")
+    ?? "";
   const rootMimetype = stringFrom(media, "mimetype")?.toLowerCase() ?? "";
   const rootKind = rootMimetype.startsWith("image/")
     ? "image"
@@ -92,6 +98,9 @@ function selectAccountMedia(value: unknown): DownloadableMedia[] {
     candidates.push({
       accountMediaId,
       mediaId,
+      ownerAccountId,
+      creatorName: null,
+      mediaBundleId: null,
       kind,
       mimetype,
       extension,
@@ -113,6 +122,34 @@ function selectAccountMedia(value: unknown): DownloadableMedia[] {
   }
   candidates.sort(compareQuality);
   return candidates.slice(0, 1);
+}
+
+export function addOfferGroupingMetadata(
+  media: DownloadableMedia[],
+  offers: unknown[]
+): DownloadableMedia[] {
+  const byAccountMediaId = new Map<string, UnknownRecord>();
+  const byMediaId = new Map<string, UnknownRecord>();
+
+  for (const value of offers) {
+    const offer = recordFrom(value);
+    if (!offer) continue;
+    const accountMediaId = idFrom(offer, "mediaOfferId");
+    const mediaId = idFrom(offer, "mediaId");
+    if (accountMediaId) byAccountMediaId.set(accountMediaId, offer);
+    if (mediaId) byMediaId.set(mediaId, offer);
+  }
+
+  return media.map((item) => {
+    const offer = byAccountMediaId.get(item.accountMediaId)
+      ?? byMediaId.get(item.mediaId);
+    if (!offer) return item;
+    return {
+      ...item,
+      ownerAccountId: item.ownerAccountId || idFrom(offer, "accountId") || "",
+      mediaBundleId: idFrom(offer, "mediaOfferBundleId")
+    };
+  });
 }
 
 function selectPreferredManifest(media: UnknownRecord): string | null {

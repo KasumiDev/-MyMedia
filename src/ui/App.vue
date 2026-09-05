@@ -15,6 +15,12 @@ import {
 } from "../core/filenames";
 import { mergeUniqueMedia } from "../core/media-library";
 import {
+  includesChatMedia,
+  mediaGroupingPath,
+  type ChatMediaDirection,
+  type CollectionSource
+} from "../core/media-source";
+import {
   isMediaSortOrder,
   sortMedia,
   type MediaSortOrder
@@ -36,11 +42,13 @@ import VideoStripePreview from "./VideoStripePreview.vue";
 
 const DOWNLOAD_REVISION_KEY = "fansly-mymedia:download-revision";
 const SETTINGS_KEY = "fansly-mymedia:settings";
-const DEFAULT_CHAT_LIMIT = 10;
+const SETTINGS_VERSION = 2;
+const DEFAULT_CHAT_LIMIT = 25;
 
 type Group = {
   groupId: string;
   partnerUsername: string;
+  partnerAccountId: string;
 };
 
 type Album = CollectionAlbum;
@@ -50,9 +58,43 @@ type MediaSourceType = "chat" | "album";
 type MediaKind = "image" | "video";
 type LibraryTab = MediaKind | "downloaded" | "failed";
 
+const collectionSourceOptions: ReadonlyArray<{
+  value: CollectionSource;
+  title: string;
+  description: string;
+}> = [
+  {
+    value: "chat",
+    title: "Chat",
+    description: "Media exchanged in selected chats."
+  },
+  {
+    value: "liked",
+    title: "Liked",
+    description: "Media from your Likes collection."
+  },
+  {
+    value: "purchased",
+    title: "Purchased",
+    description: "Media from your Purchases collection."
+  }
+];
+
+const chatDirectionOptions: ReadonlyArray<{
+  value: ChatMediaDirection;
+  label: string;
+}> = [
+  { value: "sent", label: "Only Sent Media" },
+  { value: "received", label: "Only Received Media" },
+  { value: "all", label: "All" }
+];
+
 type DiscoveredMedia = {
   accountMediaId: string;
   mediaId: string;
+  ownerAccountId: string;
+  creatorName: string | null;
+  mediaBundleId: string | null;
   kind: MediaKind;
   url: string;
   previewUrl: string | null;
@@ -72,6 +114,7 @@ type DiscoveredMedia = {
 type MediaItem = DiscoveredMedia & {
   sourceGroupId: string;
   sourceType: MediaSourceType;
+  downloadSubdirectory: string;
   state: DownloadState | "ready";
 };
 
@@ -83,12 +126,17 @@ type BridgeResult = {
 };
 
 const isSettingsOpen = ref(false);
+const hasStarted = ref(false);
 const isCollecting = ref(false);
 const isCollectionPaused = ref(false);
+const isLoadingChats = ref(false);
 const isDownloading = ref(false);
 const activeTab = ref<LibraryTab>("image");
 const groups = ref<Group[]>([]);
 const albums = ref<Album[]>([]);
+const collectionSource = ref<CollectionSource>("chat");
+const chatDirection = ref<ChatMediaDirection>("all");
+const selectedChatIds = ref(new Set<string>());
 const library = ref<MediaItem[]>([]);
 const selectedIds = ref(new Set<string>());
 const downloadIndex = ref<DownloadIndex>({});
@@ -96,8 +144,6 @@ const status = ref("Preparing the media library…");
 const currentChat = ref(0);
 const collectionSourceCount = ref(0);
 const chatLimit = ref(DEFAULT_CHAT_LIMIT);
-const includeLikes = ref(false);
-const includePurchases = ref(false);
 const minDelay = ref(1);
 const maxDelay = ref(5);
 const companionDebug = ref(false);
@@ -148,6 +194,8 @@ const visibleMedia = computed(() => {
 
 const selectedMedia = computed(() => library.value.filter((item) =>
   selectedIds.value.has(item.mediaId) && item.state === "ready"));
+const canStartCollection = computed(() => collectionSource.value !== "chat"
+  || selectedChatIds.value.size > 0);
 
 onMounted(async () => {
   chrome.storage.onChanged.addListener(handleStorageChange);
@@ -159,7 +207,7 @@ onMounted(async () => {
   directoryHandle = handle;
   downloadFolderName.value = handle?.name ?? null;
   if (handle) downloadDirectory.value = normalizeDownloadDirectory(handle.name);
-  await collectLibrary();
+  await loadChatsForSelection();
 });
 
 onBeforeUnmount(() => {
@@ -175,39 +223,67 @@ async function collectLibrary(): Promise<void> {
   isCollectionPaused.value = false;
   currentChat.value = 0;
   collectionSourceCount.value = 0;
-  status.value = "Discovering chats…";
+  status.value = "Preparing collection…";
 
   try {
-    groups.value = await paginateGroups(fetchGroups, {
-      pageSize: 30,
-      limit: chatLimit.value,
-      signal: collectionController.signal
-    });
-    await chrome.storage.local.set({ "fansly-mymedia:chats": groups.value });
-
     albums.value = [];
-    if (includeLikes.value || includePurchases.value) {
+    const selectedGroups = collectionSource.value === "chat"
+      ? groups.value.filter((group) => selectedChatIds.value.has(group.groupId))
+      : [];
+    const needsReceivedMedia = chatDirection.value !== "sent";
+    const missingPartner = selectedGroups.find((group) =>
+      needsReceivedMedia && !group.partnerAccountId);
+    if (missingPartner) {
+      throw new Error(
+        `Fansly did not return the partner account for ${missingPartner.partnerUsername || missingPartner.groupId}. Refresh the chat list and try again.`
+      );
+    }
+    const chatScans = selectedGroups.flatMap((group) => {
+      const scans: Array<{
+        group: Group;
+        accountId?: string;
+        direction: "sent" | "received";
+      }> = [];
+      if (chatDirection.value !== "received") {
+        scans.push({ group, direction: "sent" });
+      }
+      if (chatDirection.value !== "sent") {
+        scans.push({
+          group,
+          accountId: group.partnerAccountId,
+          direction: "received"
+        });
+      }
+      return scans;
+    });
+    if (collectionSource.value !== "chat") {
       status.value = "Discovering media collections…";
       const response = await fetchAlbums();
-      albums.value = response.albums.filter((album) =>
-        (album.type === LIKES_ALBUM_TYPE && includeLikes.value)
-        || (album.type === PURCHASES_ALBUM_TYPE && includePurchases.value));
+      const targetType = collectionSource.value === "liked"
+        ? LIKES_ALBUM_TYPE
+        : PURCHASES_ALBUM_TYPE;
+      albums.value = response.albums.filter((album) => album.type === targetType);
       await chrome.storage.local.set({ "fansly-mymedia:albums": albums.value });
     }
-    collectionSourceCount.value = groups.value.length + albums.value.length;
+    collectionSourceCount.value = chatScans.length + albums.value.length;
 
-    for (const [index, group] of groups.value.entries()) {
+    for (const [index, scan] of chatScans.entries()) {
       if (collectionController.signal.aborted) break;
       currentChat.value = index + 1;
-      status.value = `Collecting ${group.partnerUsername || group.groupId}…`;
+      status.value = `Collecting ${scan.direction} media from ${scan.group.partnerUsername || scan.group.groupId}…`;
       await paginateMedia(
-        (before) => fetchMedia(group.groupId, before),
+        (before) => fetchMedia(
+          scan.group.groupId,
+          before,
+          scan.accountId
+        ),
         {
           signal: collectionController.signal,
           onPage: (page) => addMedia(
             page.downloadableMedia as DiscoveredMedia[] | undefined,
-            group.groupId,
-            "chat"
+            scan.group.groupId,
+            "chat",
+            page.viewerAccountId
           )
         }
       );
@@ -215,7 +291,7 @@ async function collectLibrary(): Promise<void> {
 
     for (const [index, album] of albums.value.entries()) {
       if (collectionController.signal.aborted) break;
-      currentChat.value = groups.value.length + index + 1;
+      currentChat.value = chatScans.length + index + 1;
       status.value = `Collecting ${album.title}…`;
       await paginateMedia(
         (before) => fetchAlbumMedia(album.id, before),
@@ -242,6 +318,69 @@ async function collectLibrary(): Promise<void> {
   }
 }
 
+async function loadChatsForSelection(): Promise<void> {
+  collectionController?.abort();
+  collectionController = new AbortController();
+  isLoadingChats.value = true;
+  status.value = `Loading up to ${chatLimit.value} chats…`;
+  try {
+    groups.value = await paginateGroups(fetchGroups, {
+      pageSize: 30,
+      limit: chatLimit.value,
+      signal: collectionController.signal
+    });
+    selectedChatIds.value = new Set();
+    await chrome.storage.local.set({ "fansly-mymedia:chats": groups.value });
+    status.value = `${groups.value.length} chats loaded. Select one or more chats.`;
+  } catch (error) {
+    status.value = errorMessage(error, "Chat discovery failed.");
+  } finally {
+    isLoadingChats.value = false;
+  }
+}
+
+async function selectCollectionSource(source: CollectionSource): Promise<void> {
+  collectionSource.value = source;
+  if (source === "chat" && groups.value.length === 0) {
+    await loadChatsForSelection();
+    return;
+  }
+  status.value = source === "chat"
+    ? "Select one or more chats."
+    : `Ready to collect ${source} media.`;
+}
+
+function toggleChat(groupId: string): void {
+  const next = new Set(selectedChatIds.value);
+  if (next.has(groupId)) next.delete(groupId);
+  else next.add(groupId);
+  selectedChatIds.value = next;
+}
+
+function selectAllChats(): void {
+  selectedChatIds.value = new Set(groups.value.map((group) => group.groupId));
+}
+
+function clearChatSelection(): void {
+  selectedChatIds.value = new Set();
+}
+
+async function startCollection(): Promise<void> {
+  if (!canStartCollection.value) return;
+  hasStarted.value = true;
+  library.value = [];
+  selectedIds.value = new Set();
+  await collectLibrary();
+}
+
+function changeCollectionSource(): void {
+  collectionController?.abort();
+  isCollecting.value = false;
+  isCollectionPaused.value = false;
+  hasStarted.value = false;
+  status.value = "Choose what you want to collect.";
+}
+
 function pauseCollection(): void {
   collectionController?.abort();
   isCollectionPaused.value = true;
@@ -250,21 +389,22 @@ function pauseCollection(): void {
 async function loadSettings(): Promise<void> {
   const stored = await chrome.storage.local.get(SETTINGS_KEY);
   const settings = stored[SETTINGS_KEY] as {
+    settingsVersion?: unknown;
     chatLimit?: unknown;
     minDelay?: unknown;
     maxDelay?: unknown;
     sortOrder?: unknown;
     companionDebug?: unknown;
     downloadDirectory?: unknown;
-    includeLikes?: unknown;
-    includePurchases?: unknown;
   } | undefined;
-  chatLimit.value = validInteger(settings?.chatLimit, 1, 100_000, DEFAULT_CHAT_LIMIT);
+  const storedChatLimit = settings?.settingsVersion !== SETTINGS_VERSION
+    && settings?.chatLimit === 10
+    ? DEFAULT_CHAT_LIMIT
+    : settings?.chatLimit;
+  chatLimit.value = validInteger(storedChatLimit, 1, 100_000, DEFAULT_CHAT_LIMIT);
   minDelay.value = validInteger(settings?.minDelay, 1, 300, 1);
   maxDelay.value = validInteger(settings?.maxDelay, minDelay.value, 300, 5);
   companionDebug.value = settings?.companionDebug === true;
-  includeLikes.value = settings?.includeLikes === true;
-  includePurchases.value = settings?.includePurchases === true;
   downloadDirectory.value = normalizeDownloadDirectory(settings?.downloadDirectory);
   sortOrder.value = isMediaSortOrder(settings?.sortOrder)
     ? settings.sortOrder
@@ -278,17 +418,19 @@ async function saveSettings(): Promise<void> {
   downloadDirectory.value = normalizeDownloadDirectory(downloadDirectory.value);
   await chrome.storage.local.set({
     [SETTINGS_KEY]: {
+      settingsVersion: SETTINGS_VERSION,
       chatLimit: chatLimit.value,
       minDelay: minDelay.value,
       maxDelay: maxDelay.value,
       sortOrder: sortOrder.value,
       companionDebug: companionDebug.value,
-      downloadDirectory: downloadDirectory.value,
-      includeLikes: includeLikes.value,
-      includePurchases: includePurchases.value
+      downloadDirectory: downloadDirectory.value
     }
   });
   status.value = `Settings saved. The next collection will process up to ${chatLimit.value} chats.`;
+  if (!hasStarted.value && collectionSource.value === "chat") {
+    await loadChatsForSelection();
+  }
 }
 
 function validInteger(
@@ -305,16 +447,51 @@ function validInteger(
 function addMedia(
   items: DiscoveredMedia[] | undefined,
   sourceGroupId: string,
-  sourceType: MediaSourceType
+  sourceType: MediaSourceType,
+  viewerAccountId = ""
 ): void {
   if (!items) return;
-  const additions: MediaItem[] = items.map((item) => ({
+  const filteredItems = sourceType === "chat"
+    ? items.filter((item) => includesChatMedia(
+        item.ownerAccountId,
+        viewerAccountId,
+        chatDirection.value
+      ))
+    : items;
+  const additions: MediaItem[] = filteredItems.map((item) => ({
     ...item,
     sourceGroupId,
     sourceType,
+    downloadSubdirectory: groupingDirectory(
+      item,
+      sourceGroupId,
+      sourceType,
+      viewerAccountId
+    ),
     state: downloadIndex.value[item.mediaId]?.state ?? "ready"
   }));
   library.value = mergeUniqueMedia(library.value, additions);
+}
+
+function groupingDirectory(
+  item: DiscoveredMedia,
+  sourceGroupId: string,
+  sourceType: MediaSourceType,
+  viewerAccountId: string
+): string {
+  const chatName = groups.value.find((group) =>
+    group.groupId === sourceGroupId)?.partnerUsername;
+  const source = sourceType === "chat" ? "chat" : collectionSource.value;
+  return mediaGroupingPath({
+    source,
+    ownerAccountId: item.ownerAccountId,
+    creatorName: item.creatorName,
+    viewerAccountId,
+    chatName,
+    mediaBundleId: item.mediaBundleId
+  })
+    .map((component) => sanitizeFilenameComponent(component))
+    .join("/");
 }
 
 function toggleSelection(id: string): void {
@@ -406,6 +583,9 @@ async function queueMediaDownload(
   historyMediaId = item.mediaId
 ): Promise<BridgeResult> {
   updateItemState(historyMediaId, "queued");
+  const groupedDownloadDirectory = normalizeDownloadDirectory(
+    `${downloadDirectory.value}/${item.downloadSubdirectory}`
+  );
   const result = await chrome.runtime.sendMessage({
     type: "fansly-mymedia:download",
     url: item.url,
@@ -415,7 +595,7 @@ async function queueMediaDownload(
       mediaId: historyMediaId,
       createdAt: item.createdAt,
       extension: item.extension,
-      downloadDirectory: downloadDirectory.value
+      downloadDirectory: groupedDownloadDirectory
     }),
     downloadDirectory: downloadDirectory.value,
     mediaId: historyMediaId,
@@ -436,9 +616,11 @@ async function rediscoverFailedRecords(
   records: DownloadRecord[]
 ): Promise<Map<string, MediaItem>> {
   const found = new Map<string, MediaItem>();
+  const retryGroups = await loadRetryGroups();
   const knownBySource = new Map<string, {
     id: string;
     type: MediaSourceType;
+    accountId?: string;
     records: DownloadRecord[];
   }>();
   const unknown: DownloadRecord[] = [];
@@ -451,10 +633,16 @@ async function rediscoverFailedRecords(
       unknown.push(record);
       continue;
     }
-    const key = `${sourceType}:${sourceId}`;
+    const accountId = sourceType === "chat"
+      && record.filename.includes("/Received/")
+      ? retryGroups.find((group) =>
+          group.groupId === sourceId)?.partnerAccountId
+      : undefined;
+    const key = `${sourceType}:${sourceId}:${accountId ?? "viewer"}`;
     const source = knownBySource.get(key) ?? {
       id: sourceId,
       type: sourceType,
+      accountId,
       records: []
     };
     source.records.push(record);
@@ -463,12 +651,16 @@ async function rediscoverFailedRecords(
 
   for (const source of knownBySource.values()) {
     status.value = `Refreshing ${source.records.length} failed media from ${source.type} ${source.id}…`;
-    const matches = await findMediaInSource(source.id, source.type, source.records);
+    const matches = await findMediaInSource(
+      source.id,
+      source.type,
+      source.records,
+      source.accountId
+    );
     for (const [mediaId, item] of matches) found.set(mediaId, item);
   }
 
   if (unknown.length > 0) {
-    const retryGroups = await loadRetryGroups();
     for (const group of retryGroups) {
       const unresolved = unknown.filter((record) => !found.has(record.mediaId));
       if (unresolved.length === 0) break;
@@ -484,7 +676,8 @@ async function rediscoverFailedRecords(
 async function findMediaInSource(
   sourceId: string,
   sourceType: MediaSourceType,
-  targets: DownloadRecord[]
+  targets: DownloadRecord[],
+  accountId?: string
 ): Promise<Map<string, MediaItem>> {
   const found = new Map<string, MediaItem>();
   const visited = new Set<string>();
@@ -493,7 +686,7 @@ async function findMediaInSource(
   for (;;) {
     const page = sourceType === "album"
       ? await fetchAlbumMedia(sourceId, before)
-      : await fetchMedia(sourceId, before);
+      : await fetchMedia(sourceId, before, accountId);
     const items = (page.downloadableMedia ?? []) as DiscoveredMedia[];
     for (const record of targets) {
       if (found.has(record.mediaId)) continue;
@@ -506,6 +699,7 @@ async function findMediaInSource(
           ...match,
           sourceGroupId: sourceId,
           sourceType,
+          downloadSubdirectory: storedGroupingDirectory(record),
           state: "ready"
         });
       }
@@ -518,6 +712,13 @@ async function findMediaInSource(
   }
 }
 
+function storedGroupingDirectory(record: DownloadRecord): string {
+  const components = record.filename.split("/");
+  return components.length > 2
+    ? components.slice(1, -1).join("/")
+    : "Recovered";
+}
+
 async function loadRetryGroups(): Promise<Group[]> {
   if (groups.value.length > 0) return groups.value;
   const stored = await chrome.storage.local.get("fansly-mymedia:chats");
@@ -528,7 +729,8 @@ async function loadRetryGroups(): Promise<Group[]> {
     const candidate = group as Partial<Group>;
     return typeof candidate.groupId === "string"
       && /^\d{6,30}$/u.test(candidate.groupId)
-      && typeof candidate.partnerUsername === "string";
+      && typeof candidate.partnerUsername === "string"
+      && typeof candidate.partnerAccountId === "string";
   });
 }
 
@@ -637,13 +839,24 @@ async function fetchAlbums(): Promise<{ albums: Album[] }> {
 
 async function fetchMedia(
   groupId: string,
-  before: string
-): Promise<{ offers: { id: string }[]; accountMediaCount: number; downloadableMedia?: unknown[] }> {
-  const result = await command("media", { groupId, before });
+  before: string,
+  accountId?: string
+): Promise<{
+  offers: { id: string }[];
+  accountMediaCount: number;
+  viewerAccountId?: string;
+  downloadableMedia?: unknown[];
+}> {
+  const result = await command("media", {
+    groupId,
+    before,
+    ...(accountId ? { accountId } : {})
+  });
   if (!result.ok) throw new Error(result.error ?? "Media collection failed.");
   return result.payload as {
     offers: { id: string }[];
     accountMediaCount: number;
+    viewerAccountId?: string;
     downloadableMedia?: unknown[];
   };
 }
@@ -861,54 +1074,9 @@ function errorMessage(error: unknown, fallback: string): string {
           max="100000"
         >
         <span class="text-xs text-zinc-500">
-          Only the first {{ chatLimit }} chats will be scanned for media.
+          The first {{ chatLimit }} chats will be loaded into the source picker.
         </span>
       </label>
-      <fieldset class="grid gap-3">
-        <legend class="text-sm font-medium">
-          Additional collections
-        </legend>
-        <label
-          class="
-            flex items-start gap-3 rounded-xl border border-white/10 bg-zinc-900
-            p-4
-          "
-        >
-          <input
-            v-model="includePurchases"
-            class="mt-0.5 size-4 accent-violet-500"
-            type="checkbox"
-          >
-          <span>
-            <span class="block text-sm font-medium text-zinc-100">
-              Include Purchases
-            </span>
-            <span class="mt-1 block text-xs/5 text-zinc-400">
-              Scan media saved in Fansly's built-in Purchases collection.
-            </span>
-          </span>
-        </label>
-        <label
-          class="
-            flex items-start gap-3 rounded-xl border border-white/10 bg-zinc-900
-            p-4
-          "
-        >
-          <input
-            v-model="includeLikes"
-            class="mt-0.5 size-4 accent-violet-500"
-            type="checkbox"
-          >
-          <span>
-            <span class="block text-sm font-medium text-zinc-100">
-              Include Likes
-            </span>
-            <span class="mt-1 block text-xs/5 text-zinc-400">
-              Scan media saved in Fansly's built-in Likes collection.
-            </span>
-          </span>
-        </label>
-      </fieldset>
       <label class="grid gap-2 text-sm">
         Minimum delay (seconds)
         <input
@@ -961,7 +1129,7 @@ function errorMessage(error: unknown, fallback: string): string {
       </button>
     </div>
 
-    <template v-else>
+    <template v-else-if="hasStarted">
       <div class="flex items-center gap-4 border-b border-white/10 px-6 py-3">
         <div class="min-w-0 flex-1">
           <div class="flex justify-between text-xs text-zinc-400">
@@ -979,6 +1147,17 @@ function errorMessage(error: unknown, fallback: string): string {
             />
           </div>
         </div>
+        <button
+          class="
+            rounded-lg bg-zinc-800 px-4 py-2 text-sm transition
+            hover:bg-zinc-700
+          "
+          type="button"
+          :disabled="isCollecting"
+          @click="changeCollectionSource"
+        >
+          Change source
+        </button>
         <button
           class="
             rounded-lg bg-violet-600 px-4 py-2 text-sm font-medium transition
@@ -1304,6 +1483,180 @@ function errorMessage(error: unknown, fallback: string): string {
         </button>
       </footer>
     </template>
+
+    <main
+      v-else
+      class="min-h-0 flex-1 overflow-auto p-6"
+    >
+      <div class="mx-auto grid max-w-4xl gap-6">
+        <div>
+          <h2 class="text-2xl font-semibold tracking-tight">
+            Choose media source
+          </h2>
+          <p class="mt-2 text-sm text-zinc-400">
+            Select one source for this collection run. Download history remains
+            available between runs.
+          </p>
+        </div>
+
+        <fieldset
+          class="
+            grid gap-3
+            sm:grid-cols-3
+          "
+        >
+          <legend class="sr-only">
+            Media source
+          </legend>
+          <button
+            v-for="source in collectionSourceOptions"
+            :key="source.value"
+            class="
+              rounded-xl border p-4 text-left transition
+              hover:border-violet-400/60
+            "
+            :class="collectionSource === source.value
+              ? 'border-violet-400 bg-violet-500/10'
+              : 'border-white/10 bg-zinc-900'"
+            type="button"
+            @click="selectCollectionSource(source.value)"
+          >
+            <span class="block text-sm font-semibold text-zinc-100">
+              {{ source.title }}
+            </span>
+            <span class="mt-1 block text-xs/5 text-zinc-400">
+              {{ source.description }}
+            </span>
+          </button>
+        </fieldset>
+
+        <section
+          v-if="collectionSource === 'chat'"
+          class="grid gap-5 rounded-2xl border border-white/10 bg-zinc-900 p-5"
+        >
+          <fieldset class="grid gap-3">
+            <legend class="text-sm font-medium text-zinc-200">
+              Which messages should be included?
+            </legend>
+            <div class="flex flex-wrap gap-2">
+              <label
+                v-for="direction in chatDirectionOptions"
+                :key="direction.value"
+                class="
+                  cursor-pointer rounded-lg border px-4 py-2 text-sm transition
+                "
+                :class="chatDirection === direction.value
+                  ? 'border-violet-400 bg-violet-500/15 text-white'
+                  : 'border-white/10 bg-zinc-950 text-zinc-400'"
+              >
+                <input
+                  v-model="chatDirection"
+                  class="sr-only"
+                  type="radio"
+                  name="chat-direction"
+                  :value="direction.value"
+                >
+                {{ direction.label }}
+              </label>
+            </div>
+          </fieldset>
+
+          <div class="flex flex-wrap items-center gap-3">
+            <div class="mr-auto">
+              <h3 class="text-sm font-medium text-zinc-200">
+                Select chats
+              </h3>
+              <p class="mt-1 text-xs text-zinc-500">
+                {{ selectedChatIds.size }} of {{ groups.length }} selected
+              </p>
+            </div>
+            <button
+              class="
+                rounded-lg bg-zinc-800 px-3 py-2 text-xs
+                hover:bg-zinc-700
+              "
+              type="button"
+              :disabled="isLoadingChats"
+              @click="loadChatsForSelection"
+            >
+              {{ isLoadingChats ? "Loading…" : "Refresh chats" }}
+            </button>
+            <button
+              class="
+                rounded-lg bg-zinc-800 px-3 py-2 text-xs
+                hover:bg-zinc-700
+              "
+              type="button"
+              :disabled="groups.length === 0"
+              @click="selectAllChats"
+            >
+              Select all
+            </button>
+            <button
+              class="
+                rounded-lg bg-zinc-800 px-3 py-2 text-xs
+                hover:bg-zinc-700
+              "
+              type="button"
+              :disabled="selectedChatIds.size === 0"
+              @click="clearChatSelection"
+            >
+              Clear
+            </button>
+          </div>
+
+          <div
+            v-if="groups.length"
+            class="
+              grid max-h-80 gap-2 overflow-auto
+              sm:grid-cols-2
+            "
+          >
+            <label
+              v-for="group in groups"
+              :key="group.groupId"
+              class="
+                flex cursor-pointer items-center gap-3 rounded-lg border
+                border-white/10 bg-zinc-950 p-3
+                hover:border-white/20
+              "
+            >
+              <input
+                class="size-4 shrink-0 accent-violet-500"
+                type="checkbox"
+                :checked="selectedChatIds.has(group.groupId)"
+                @change="toggleChat(group.groupId)"
+              >
+              <span class="min-w-0 truncate text-sm text-zinc-200">
+                {{ group.partnerUsername || group.groupId }}
+              </span>
+            </label>
+          </div>
+          <div
+            v-else
+            class="grid min-h-24 place-items-center text-sm text-zinc-500"
+          >
+            {{ isLoadingChats ? "Loading chats…" : "No chats loaded." }}
+          </div>
+        </section>
+
+        <div class="flex justify-end">
+          <button
+            class="
+              rounded-lg bg-violet-600 px-5 py-2.5 text-sm font-medium
+              transition
+              hover:bg-violet-500
+              disabled:cursor-not-allowed disabled:opacity-40
+            "
+            type="button"
+            :disabled="!canStartCollection || isLoadingChats"
+            @click="startCollection"
+          >
+            Start collection
+          </button>
+        </div>
+      </div>
+    </main>
 
     <output class="border-t border-white/10 px-6 py-2 text-xs text-zinc-500">{{ status }}</output>
   </section>

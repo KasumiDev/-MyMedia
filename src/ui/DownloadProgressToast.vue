@@ -17,7 +17,10 @@ import {
   browserDownloadQueueKey,
   type BrowserDownloadJob
 } from "../core/browser-download";
-import { sanitizeFilenameComponent } from "../core/filenames";
+import {
+  isValidDownloadFilename,
+  sanitizeFilenameComponent
+} from "../core/filenames";
 import {
   authorizeHlsRequestUrl,
   preferMuxedHlsAudio
@@ -194,7 +197,7 @@ async function runJob(job: BrowserDownloadJob): Promise<void> {
     const message = error instanceof Error ? error.message : "Browser download failed.";
     status.value = message;
     await writable?.abort().catch(() => undefined);
-    await directoryHandle?.removeEntry(job.outputFilename).catch(() => undefined);
+    await removeOutputFile(job.outputFilename);
     await updateHistory(job, "failed", message);
     debugLog("download.failed", { message });
   } finally {
@@ -225,7 +228,7 @@ async function downloadHls(job: BrowserDownloadJob): Promise<HlsAudioMode> {
     } catch (error) {
       await conversion?.cancel().catch(() => undefined);
       await writable?.abort().catch(() => undefined);
-      await directoryHandle?.removeEntry(job.outputFilename).catch(() => undefined);
+      await removeOutputFile(job.outputFilename);
       const canFallback = !cancelRequested && (
         mode === "muxed"
         || error instanceof HlsAudioRequestError
@@ -416,11 +419,41 @@ async function downloadHlsAttempt(
 async function createOutputWritable(
   outputFilename: string
 ): Promise<FileSystemWritableFileStream> {
-  const fileHandle = await directoryHandle?.getFileHandle(outputFilename, {
+  const target = await resolveOutputTarget(outputFilename, true);
+  const fileHandle = await target.directory.getFileHandle(target.filename, {
     create: true
   });
-  if (!fileHandle) throw new Error("The download folder is unavailable.");
   return fileHandle.createWritable();
+}
+
+async function removeOutputFile(outputFilename: string): Promise<void> {
+  try {
+    const target = await resolveOutputTarget(outputFilename, false);
+    await target.directory.removeEntry(target.filename);
+  } catch {
+    // A partial file may not exist when a request fails before writing starts.
+  }
+}
+
+async function resolveOutputTarget(
+  outputFilename: string,
+  createDirectories: boolean
+): Promise<{ directory: FileSystemDirectoryHandle; filename: string }> {
+  if (!directoryHandle
+    || !isValidDownloadFilename(`Downloads/${outputFilename}`)) {
+    throw new Error("The grouped download path is invalid.");
+  }
+  const components = outputFilename.split("/");
+  const filename = components.pop();
+  if (!filename) throw new Error("The grouped download filename is missing.");
+
+  let directory = directoryHandle;
+  for (const component of components) {
+    directory = await directory.getDirectoryHandle(component, {
+      create: createDirectories
+    });
+  }
+  return { directory, filename };
 }
 
 function hlsAttemptStatus(outputFilename: string, mode: HlsAudioMode): string {

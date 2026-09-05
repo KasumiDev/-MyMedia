@@ -1,10 +1,14 @@
 import { describe, expect, it } from "vitest";
-import { selectDownloadableMedia } from "../src/core/media-parser";
+import {
+  addOfferGroupingMetadata,
+  selectDownloadableMedia
+} from "../src/core/media-parser";
 
 describe("media previews", () => {
   it("uses the smallest regular rendition for a tall portrait image", () => {
     const media = selectDownloadableMedia([{
       id: "100000000000000030",
+      accountId: "100000000000000001",
       likeCount: 17,
       price: 499,
       media: {
@@ -34,6 +38,7 @@ describe("media previews", () => {
     expect(media[0]?.originalFilename).toBe("portrait.jpeg");
     expect(media[0]?.likeCount).toBe(17);
     expect(media[0]?.price).toBe(499);
+    expect(media[0]?.ownerAccountId).toBe("100000000000000001");
   });
 
   it("does not fall back to a full-resolution image", () => {
@@ -128,6 +133,29 @@ describe("media previews", () => {
     expect(manifest.searchParams.get("Policy")).toBe("policy");
     expect(manifest.searchParams.get("Signature")).toBe("signature");
     expect(manifest.searchParams.get("Key-Pair-Id")).toBe("key");
+  });
+
+  it("associates offer bundle metadata with downloadable media", () => {
+    const media = selectDownloadableMedia([{
+      id: "100000000000000030",
+      accountId: "100000000000000001",
+      media: {
+        id: "100000000000000031",
+        mimetype: "image/jpeg",
+        filename: "grouped.jpeg",
+        width: 640,
+        height: 480,
+        locations: [{ location: "https://cdn3.fansly.com/grouped.jpeg" }]
+      }
+    }]);
+
+    const grouped = addOfferGroupingMetadata(media, [{
+      mediaOfferId: "100000000000000030",
+      mediaId: "100000000000000031",
+      mediaOfferBundleId: "100000000000000040"
+    }]);
+
+    expect(grouped[0]?.mediaBundleId).toBe("100000000000000040");
   });
 });
 

@@ -1,6 +1,7 @@
 export interface ChatGroup {
   groupId: string;
   partnerUsername: string;
+  partnerAccountId: string;
 }
 
 export interface MediaOffer {
@@ -10,6 +11,7 @@ export interface MediaOffer {
 export interface MediaPage {
   offers: MediaOffer[];
   accountMediaCount: number;
+  viewerAccountId?: string;
   downloadableMedia?: unknown[];
 }
 

@@ -6,7 +6,11 @@ describe("pagination", () => {
     const offsets: number[] = [];
     const result = await paginateGroups(async (offset) => {
       offsets.push(offset);
-      return { groups: offset === 0 ? [{ groupId: "1", partnerUsername: "a" }] : [] };
+      return {
+        groups: offset === 0
+          ? [{ groupId: "1", partnerUsername: "a", partnerAccountId: "2" }]
+          : []
+      };
     }, { pageSize: 30, signal: new AbortController().signal });
     expect(offsets).toEqual([0, 30]);
     expect(result).toHaveLength(1);
@@ -19,7 +23,8 @@ describe("pagination", () => {
       return {
         groups: Array.from({ length: 30 }, (_, index) => ({
           groupId: String(offset + index + 1),
-          partnerUsername: `creator-${offset + index + 1}`
+          partnerUsername: `creator-${offset + index + 1}`,
+          partnerAccountId: String(offset + index + 101)
         }))
       };
     }, {

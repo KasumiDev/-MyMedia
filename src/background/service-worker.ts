@@ -124,7 +124,7 @@ export function installServiceWorker(): void {
       const job: BrowserDownloadJob = {
         kind: hlsManifest ? "hls" : "direct",
         sourceUrl: (hlsManifest ?? url).toString(),
-        outputFilename: historyFilename.slice(historyFilename.lastIndexOf("/") + 1),
+        outputFilename: historyFilename.slice(downloadDirectory.length + 1),
         historyFilename,
         mediaId,
         accountMediaId,

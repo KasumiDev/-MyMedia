@@ -6,6 +6,7 @@ export interface BridgeRelayRequest {
   type: typeof BRIDGE_RELAY_REQUEST;
   operation: BridgeRelayOperation;
   groupId?: string;
+  accountId?: string;
   albumId?: string;
   offset?: number;
   before?: string;
@@ -45,11 +46,17 @@ export function parseRelayRequest(value: unknown): BridgeRelayRequest | null {
     || typeof request.before !== "string" || !/^\d{0,30}$/u.test(request.before)) {
     return null;
   }
+  if (request.operation === "media" && request.accountId !== undefined
+    && (typeof request.accountId !== "string"
+      || !/^\d{6,30}$/u.test(request.accountId))) {
+    return null;
+  }
   return request.operation === "media"
     ? {
         type: BRIDGE_RELAY_REQUEST,
         operation: "media",
         groupId: locationId,
+        ...(request.accountId === undefined ? {} : { accountId: request.accountId }),
         before: request.before
       }
     : {

@@ -1,6 +1,11 @@
 import { delay, isEmptySuggestion, MAX_EMPTY_SUGGESTION_RETRIES, MAX_RATE_LIMIT_RETRIES, NORMAL_DELAY_MS, randomDelay, RATE_LIMIT_DELAY_MS } from "../core/retry-policy";
-import { selectDiagnosticManifest, selectDownloadableMedia } from "../core/media-parser";
+import {
+  addOfferGroupingMetadata,
+  selectDiagnosticManifest,
+  selectDownloadableMedia
+} from "../core/media-parser";
 import { selectCollectionAlbums } from "../core/albums";
+import { selectCreatorProfiles } from "../core/creator-profiles";
 
 const BRIDGE_COMMAND = "fansly-mymedia:command";
 export {};
@@ -11,6 +16,7 @@ interface BridgeCommand {
   requestId: string;
   operation: BridgeOperation;
   groupId?: string;
+  accountId?: string;
   albumId?: string;
   offset?: number;
   before?: string;
@@ -35,6 +41,7 @@ export function installBridge(): void {
 
 let lastRequestAt = 0;
 const sessionHeaders = new Headers();
+const creatorNameCache = new Map<string, string>();
 const SESSION_HEADER_NAMES = new Set([
   "authorization",
   "fansly-client-id",
@@ -50,6 +57,9 @@ function isCommand(value: unknown): value is BridgeCommand {
   if (!["account", "groups", "media", "albums", "albumMedia"]
     .includes(candidate.operation ?? "")) return false;
   if (candidate.operation === "media" && !isValidGroupId(candidate.groupId)) return false;
+  if (candidate.accountId !== undefined && !isValidGroupId(candidate.accountId)) {
+    return false;
+  }
   if (candidate.operation === "albumMedia" && !isValidGroupId(candidate.albumId)) {
     return false;
   }
@@ -93,8 +103,19 @@ async function request(command: BridgeCommand): Promise<unknown> {
     Object.entries({ albumId: command.albumId!, before: command.before || "0", after: "0", limit: "25" })
       .forEach(([key, value]) => url.searchParams.set(key, value));
   }
+  let viewerAccountId: string | undefined;
   if (command.operation === "media") {
-    Object.entries({ locationId: command.groupId!, locationType: "4001", accountId: await accountId(), mediaType: "", before: command.before ?? "", after: "0", limit: "30", offset: "0" })
+    viewerAccountId = await accountId();
+    Object.entries({
+      locationId: command.groupId!,
+      locationType: "4001",
+      accountId: command.accountId ?? viewerAccountId,
+      mediaType: "",
+      before: command.before ?? "",
+      after: "0",
+      limit: "30",
+      offset: "0"
+    })
       .forEach(([key, value]) => url.searchParams.set(key, value));
   }
 
@@ -106,7 +127,8 @@ async function request(command: BridgeCommand): Promise<unknown> {
     await fetchJsonWithRetry(
       url,
       command.operation === "media" || command.operation === "albumMedia"
-    )
+    ),
+    viewerAccountId
   );
 }
 
@@ -154,7 +176,11 @@ async function accountId(): Promise<string> {
   return String(id);
 }
 
-function sanitize(operation: BridgeOperation, json: unknown): unknown {
+async function sanitize(
+  operation: BridgeOperation,
+  json: unknown,
+  viewerAccountId?: string
+): Promise<unknown> {
   const response = (json as { response?: unknown })?.response;
   if (operation === "account") {
     const id = (response as { account?: { id?: unknown } })?.account?.id;
@@ -180,7 +206,13 @@ function sanitize(operation: BridgeOperation, json: unknown): unknown {
       : "MyMedia response was malformed"
   );
   const media = requiredArray(mediaResponse?.aggregationData, ["accountMedia"], "MyMedia aggregation response was malformed");
-  const downloadableMedia = selectDownloadableMedia(media);
+  let downloadableMedia = addOfferGroupingMetadata(
+    selectDownloadableMedia(media),
+    data
+  );
+  if (operation === "albumMedia") {
+    downloadableMedia = await addCreatorNames(downloadableMedia);
+  }
   const video = downloadableMedia.filter((item) => item.kind === "video")[0] ?? null;
   const dashManifest = selectDiagnosticManifest(media, "application/dash+xml");
   const hlsManifest = selectDiagnosticManifest(media, "application/vnd.apple.mpegurl");
@@ -188,6 +220,7 @@ function sanitize(operation: BridgeOperation, json: unknown): unknown {
     offerCount: data.length,
     offers: data.map(offerSummary).filter((offer): offer is { id: string } => offer !== null),
     accountMediaCount: media.length,
+    ...(operation === "media" ? { viewerAccountId } : {}),
     // The signed URL is transferred only in-memory to immediately request a
     // Chrome download. It is never rendered, logged, or persisted.
     downloadableMedia,
@@ -197,6 +230,33 @@ function sanitize(operation: BridgeOperation, json: unknown): unknown {
     dashManifest: dashManifest ? { ...dashManifest, filename: `Fansly MyMedia/${dashManifest.accountMediaId}.mpd` } : null,
     hlsManifest: hlsManifest ? { ...hlsManifest, filename: `Fansly MyMedia/${hlsManifest.accountMediaId}.m3u8` } : null
   };
+}
+
+async function addCreatorNames(
+  media: ReturnType<typeof selectDownloadableMedia>
+): Promise<ReturnType<typeof selectDownloadableMedia>> {
+  const unresolvedIds = [...new Set(media
+    .map((item) => item.ownerAccountId)
+    .filter((id) => id && !creatorNameCache.has(id)))];
+
+  if (unresolvedIds.length > 0) {
+    const url = new URL("https://apiv3.fansly.com/api/v1/account");
+    url.searchParams.set("ngsw-bypass", "true");
+    url.searchParams.set("ids", unresolvedIds.join(","));
+    try {
+      const json = await fetchJsonWithRetry(url, false);
+      for (const profile of selectCreatorProfiles(json)) {
+        creatorNameCache.set(profile.accountId, profile.username);
+      }
+    } catch {
+      // Profile names improve folder labels but are not required for downloads.
+    }
+  }
+
+  return media.map((item) => ({
+    ...item,
+    creatorName: creatorNameCache.get(item.ownerAccountId) ?? null
+  }));
 }
 
 function requiredArray(response: unknown, keys: string[], message: string): unknown[] {
@@ -210,10 +270,34 @@ function offerSummary(value: unknown): { id: string } | null {
   return typeof id === "string" || typeof id === "number" ? { id: String(id) } : null;
 }
 
-function groupSummary(value: unknown): { groupId: string; partnerUsername: string } | null {
-  const group = value as { groupId?: unknown; partnerUsername?: unknown };
+function groupSummary(value: unknown): {
+  groupId: string;
+  partnerUsername: string;
+  partnerAccountId: string;
+} | null {
+  const group = value as Record<string, unknown>;
+  const partner = group?.partner && typeof group.partner === "object"
+    ? group.partner as Record<string, unknown>
+    : null;
+  const partnerAccountId = [
+    group?.partnerAccountId,
+    group?.partnerId,
+    partner?.accountId,
+    partner?.id,
+    group?.accountId
+  ]
+    .map((candidate) => String(candidate ?? ""))
+    .find(isValidGroupId) ?? "";
   return isValidGroupId(String(group?.groupId ?? ""))
-    ? { groupId: String(group.groupId), partnerUsername: typeof group.partnerUsername === "string" ? group.partnerUsername : "" }
+    ? {
+        groupId: String(group.groupId),
+        partnerUsername: typeof group.partnerUsername === "string"
+          ? group.partnerUsername
+          : typeof partner?.username === "string"
+            ? partner.username
+            : "",
+        partnerAccountId
+      }
     : null;
 }
 
